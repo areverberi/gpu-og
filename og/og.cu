@@ -29,30 +29,29 @@ char* mystrsep(char** stringp, const char* delim)
 
   return start;
 }
-__global__ void __launch_bounds__(1024) initMap(float* map, int w, int h, size_t pitch, int numX, int numY){
-	int idx=blockIdx.x*blockDim.x+threadIdx.x;
-	int idy=blockIdx.y*blockDim.y+threadIdx.y;
-	if(idx<h && idy<w){
-		map[idx*pitch+idy]=-1.0f;
-	}
+__global__ void __launch_bounds__(1024) initMap(float* map, int w, int h, int numX, int numY){
+	unsigned int i=(blockIdx.x*blockDim.x)+threadIdx.x;
+	for(; i<w*h; i+=gridDim.x*blockDim.x)
+		map[i]=-1.0f;
     __syncthreads();
 }
-__global__ void updateMapBresenham(float x, float y, float theta, float *map, size_t pitch, float *scan_gpu, int mapW, int mapH, float rmax){
+__global__ void updateMapBresenham(float x, float y, float theta, float *map, float *scan_gpu, int mapW, int mapH, float rmax){
 	__shared__ float range;
 	__shared__ int x1, y1, x2, y2;
 	__shared__ float delta_x, delta_y, m;
 	__shared__ int sign_delta_x, sign_delta_y;
+	__shared__ float theta_b;
 
 	if(threadIdx.x==0)
 	{
 		range=scan_gpu[blockIdx.x];
-		theta+=blockIdx.x*M_PI/359-M_PI_2;
+		theta_b=theta+blockIdx.x*M_PI/359-M_PI_2;
 		//mapW/H is offset, 0.1f is resolution
 		x1=(int)floor(+mapW/2+x/0.025f);
 		y1=(int)floor(+mapH/2+y/0.025f);
 		//0.1f for wall thickness, if needed, add to range before mul
-		x2=(int)floor(+mapW/2+x+((range+0.1f)*cos(theta))/0.025f);
-		y2=(int)floor(+mapH/2+y+((range+0.1f)*sin(theta))/0.025f);
+		x2=(int)floor(+mapW/2+x+((range+0.1f)*cos(theta_b))/0.025f);
+		y2=(int)floor(+mapH/2+y+((range+0.1f)*sin(theta_b))/0.025f);
 		delta_x=(float)(x2-x1);
 		delta_y=(float)(y2-y1);
 		sign_delta_x=1;
@@ -120,10 +119,10 @@ __global__ void updateMapBresenham(float x, float y, float theta, float *map, si
 				
 				if (d<=range+0.1f && d<=6.4f)
 				{
-					float pr=map[current_x+current_y*pitch];
+					float pr=map[current_x+current_y*mapW];
 					if(pr==-1.0f)
 						pr=0.5f;
-					map[current_x+current_y*pitch]=1.0f-1.0f/(1.0f+prob/(1.0f-prob)*pr/(1.0f-pr));
+					map[current_x+current_y*mapW]=1.0f-1.0f/(1.0f+prob/(1.0f-prob)*pr/(1.0f-pr));
 
 					//printf("-------------------------------------------------------------------updating map\n");  
 				}
@@ -294,22 +293,15 @@ int main(int argc, char** argv){
     int width=map_size;
     int height=map_size;
     float* map;
-    size_t pitch;
-	checkCudaErrors(cudaMallocPitch(&map,&pitch,width*sizeof(float), height));
-	int numT=32;
-	int numBX=(int)ceil((float)width/numT);
-	int numBY=(int)ceil((float)height/numT);
-	dim3 numBlocks(numBX, numBY);
-    dim3 numThr(numT, numT);
-    initMap <<<numBlocks, numThr>>> (map, width, height, pitch/sizeof(float), 1, 1);
+	checkCudaErrors(cudaMalloc(&map,height*width*sizeof(float)));
+	initMap <<<width*height/512, 512>>> (map, width, height, 1, 1);
 	cudaError_t err=cudaGetLastError();
 	if (err != cudaSuccess) 
 		printf("Error: %s\n", cudaGetErrorString(err));
 	checkCudaErrors(cudaDeviceSynchronize());
 	float *mapsave;
 	mapsave=(float*)calloc(width*height,sizeof(float));
-	size_t pitchSave=sizeof(float)*width;
-	checkCudaErrors(cudaMemcpy2D(mapsave, pitchSave, map, pitch, width*sizeof(float), height, cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(mapsave, map,  height*width*sizeof(float), cudaMemcpyDeviceToHost));
 	FILE *img;
 	img=fopen("mapinit.dat", "w");
 	if(img!=NULL){
@@ -456,7 +448,7 @@ int main(int argc, char** argv){
 		cudaEventCreate(&stop);
 		cudaEventRecord(start, 0);
 		//updateMap<<<numBlU, numThrU>>>(x, y, theta*M_PI/180.0f, map, scan_gpu, pitch/sizeof(float), width, height, local_size);
-		updateMapBresenham<<<360, 256>>>(x, y, theta, map, pitch/sizeof(float),scan_gpu, width, height, local_size);
+		updateMapBresenham<<<360, 256>>>(x, y, theta, map, scan_gpu, width, height, local_size);
 		cudaEventRecord(stop, 0);
 		cudaEventSynchronize(stop);
 		cudaEventElapsedTime(&time, start, stop);
@@ -474,8 +466,7 @@ int main(int argc, char** argv){
 			float *mapsave;
 			/*saving map at every iteration, just for testing purposes*/
 			mapsave=(float*)calloc(width*height,sizeof(float));
-			size_t pitchSave=sizeof(float)*width;
-			checkCudaErrors(cudaMemcpy2D(mapsave, pitchSave, map, pitch, width*sizeof(float), height, cudaMemcpyDeviceToHost));
+			checkCudaErrors(cudaMemcpy(mapsave, map, height*width*sizeof(float), cudaMemcpyDeviceToHost));
 			FILE *img;
 			char filename[40];
 			sprintf(filename, "map%d.dat", index);
