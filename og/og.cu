@@ -67,12 +67,15 @@ __global__ void updateMapBresenham(float *map, size_t pitch, float *scan_gpu){
 	{
 		range=scan_gpu[blockIdx.x];
 		theta_b=theta+blockIdx.x*M_PI/359-M_PI_2;
+		float s;
+		float c;
+		__sincosf(theta_b, &s, &c);
 		//mapW/H is offset, 0.1f is resolution
 		x1=(int)floorf(mapW/2+x/resolution);
 		y1=(int)floorf(mapH/2+y/resolution);
 		//0.1f for wall thickness, if needed, add to range before mul
-		x2=(int)floorf(mapW/2+(x+(range+0.1f)*__cosf(theta_b))/resolution);
-		y2=(int)floorf(mapH/2+(y+(range+0.1f)*__sinf(theta_b))/resolution);
+		x2=(int)floorf(mapW/2+(x+(range+0.1f)*c)/resolution);
+		y2=(int)floorf(mapH/2+(y+(range+0.1f)*s)/resolution);
 		delta_x=(float)(x2-x1);
 		delta_y=(float)(y2-y1);
 		/*
