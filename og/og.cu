@@ -48,7 +48,7 @@ __global__ void __launch_bounds__(1024) initMap(float* map, int w, int h, size_t
 		{
 			unsigned int x=idx*w_th+j;
 			unsigned int y=idy*h_th+i;
-			if(idx<w && idy<h)
+			if(x<w && y<h)
 			{
 				map[x+y*pitch]=-1.0f;
 			}
