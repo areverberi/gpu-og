@@ -465,11 +465,22 @@ int main(int argc, char** argv){
 	float tot_time=0.0f;
     for(index=0; index<len; index++){
 		/*taking one range reading at a time*/
+		cudaEvent_t start, stop;
+		float time;
+		cudaEventCreate(&start);
+		cudaEventCreate(&stop);
+		cudaEventRecord(start, 0);
         float* scan=scans[index];
-        float x_h=xs[index];
-        float y_h=ys[index];
-        float theta_h=thetas[index];
-		printf("position:%f %f %f\n", x_h, y_h, theta_h);
+		float * x_h;
+		float * y_h;
+		float * theta_h;
+		checkCudaErrors(cudaMallocHost(&x_h, sizeof(float)));
+		checkCudaErrors(cudaMallocHost(&y_h, sizeof(float)));
+		checkCudaErrors(cudaMallocHost(&theta_h, sizeof(float)));
+        *x_h=xs[index];
+        *y_h=ys[index];
+        *theta_h=thetas[index];
+		printf("position:%f %f %f\n", *x_h, *y_h, *theta_h);
 		float *scan_gpu;
 		checkCudaErrors(cudaMalloc(&scan_gpu, sizeof(float)*numReadings));
 		checkCudaErrors(cudaMemcpy(scan_gpu, scan, numReadings*sizeof(float), cudaMemcpyHostToDevice));
@@ -479,16 +490,15 @@ int main(int argc, char** argv){
 		dim3 numThrU(numTU, numTU);
 		dim3 numBlU(numBU, numBU);
 		*/
-		cudaEvent_t start, stop;
-		float time;
-		cudaEventCreate(&start);
-		cudaEventCreate(&stop);
-		cudaEventRecord(start, 0);
 		checkCudaErrors(cudaMemcpyToSymbol(x, &x_h, sizeof(float)));
 		checkCudaErrors(cudaMemcpyToSymbol(y, &y_h, sizeof(float)));
 		checkCudaErrors(cudaMemcpyToSymbol(theta, &theta_h, sizeof(float)));
 		//updateMap<<<numBlU, numThrU>>>(x, y, theta*M_PI/180.0f, map, scan_gpu, pitch/sizeof(float), width, height, local_size);
 		updateMapBresenham<<<360, 256>>>(map, pitch/sizeof(float),scan_gpu);
+		checkCudaErrors(cudaFree(scan_gpu));
+		checkCudaErrors(cudaFreeHost(x_h));
+		checkCudaErrors(cudaFreeHost(y_h));
+		checkCudaErrors(cudaFreeHost(theta_h));
 		cudaEventRecord(stop, 0);
 		cudaEventSynchronize(stop);
 		cudaEventElapsedTime(&time, start, stop);
@@ -500,8 +510,6 @@ int main(int argc, char** argv){
 			printf("Error: %s\n", cudaGetErrorString(err));
 			return -1;
 		}
-		checkCudaErrors(cudaFree(scan_gpu));
-		
 		if(index%100==0){
 			float *mapsave;
 			/*saving map at every iteration, just for testing purposes*/
