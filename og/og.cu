@@ -500,11 +500,12 @@ int main(int argc, char** argv){
 		float *scan_gpu;
 		checkCudaErrors(cudaMalloc(&scan_gpu, sizeof(float)*numReadings));
 		checkCudaErrors(cudaMemcpy(scan_gpu, scan, numReadings*sizeof(float), cudaMemcpyHostToDevice));
-		int numTU=32;
+		/*int numTU=32;
 		int numBU=(int)ceil((float)local_size/numTU);
 		printf("num blocks:%d\n", numBU);
 		dim3 numThrU(numTU, numTU);
 		dim3 numBlU(numBU, numBU);
+		*/
 		cudaEvent_t start, stop;
 		float time;
 		cudaEventCreate(&start);
@@ -520,7 +521,7 @@ int main(int argc, char** argv){
 		cudaEventElapsedTime(&time, start, stop);
 		cudaEventDestroy(start);
 		cudaEventDestroy(stop);
-		printf("elapsed time:%f\n", time);
+		//printf("elapsed time:%f\n", time);
 		tot_time+=time;
 		cudaError_t err=cudaGetLastError();
 		if (err != cudaSuccess){ 
