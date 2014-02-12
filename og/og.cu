@@ -333,7 +333,9 @@ int main(int argc, char** argv){
 		printf("Error: %s\n", cudaGetErrorString(err));
 	checkCudaErrors(cudaDeviceSynchronize());
 	float *mapsave;
-	mapsave=(float*)calloc(width*height,sizeof(float));
+	cudaError_t status=cudaMallocHost(&mapsave, width*height*sizeof(float));
+	if(status!=cudaSuccess)
+		printf("error allocating pinned memory\n");
 	size_t pitchSave=sizeof(float)*width;
 	checkCudaErrors(cudaMemcpy2D(mapsave, pitchSave, map, pitch, width*sizeof(float), height, cudaMemcpyDeviceToHost));
 	FILE *img;
@@ -350,7 +352,7 @@ int main(int argc, char** argv){
 				fprintf(img, " ");
 		}*/
 	}
-	free(mapsave);
+	cudaFreeHost(mapsave);
 	fclose(img);
 
 	/*checkCudaErrors(cudaBindTexture2D(0,sensor_model, s_m_gpu, local_size*((int)s_m_resolution), local_size*((int)s_m_resolution), pitch_s));
@@ -503,7 +505,7 @@ int main(int argc, char** argv){
 		if(index%100==0){
 			float *mapsave;
 			/*saving map at every iteration, just for testing purposes*/
-			mapsave=(float*)calloc(width*height,sizeof(float));
+			cudaMallocHost(&mapsave, width*height*sizeof(float));
 			size_t pitchSave=sizeof(float)*width;
 			checkCudaErrors(cudaMemcpy2D(mapsave, pitchSave, map, pitch, width*sizeof(float), height, cudaMemcpyDeviceToHost));
 			FILE *img;
@@ -522,7 +524,7 @@ int main(int argc, char** argv){
 						fprintf(img, " ");
 				}*/
 			}
-			free(mapsave);
+			cudaFreeHost(mapsave);
 			fclose(img);
 		}
     }
