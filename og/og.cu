@@ -10,9 +10,9 @@
 //texture <float, 2, cudaReadModeElementType> angle;
 //texture <float, 2, cudaReadModeElementType> sensor_model;
 
-__constant__ float x;
-__constant__ float y;
-__constant__ float theta;
+//__constant__ float x;
+//__constant__ float y;
+//__constant__ float theta;
 __constant__ int mapW;
 __constant__ int mapH;
 __constant__ float resolution;
@@ -56,8 +56,9 @@ __global__ void __launch_bounds__(1024) initMap(float* map, int w, int h, size_t
 	}
     __syncthreads();
 }
-__global__ void updateMapBresenham(float *map, size_t pitch, float *scan_gpu){
-	__shared__ float range;
+
+__device__ void getCoordsBresenham(float *coords, float * range, float * x_o, float * y_o, float * theta_o)
+{
 	__shared__ int x1, y1, x2, y2;
 	__shared__ float delta_x, delta_y, m;
 	__shared__ int sign_delta_x, sign_delta_y;
@@ -65,17 +66,16 @@ __global__ void updateMapBresenham(float *map, size_t pitch, float *scan_gpu){
 
 	if(threadIdx.x==0)
 	{
-		range=scan_gpu[blockIdx.x];
-		theta_b=theta+blockIdx.x*M_PI/359-M_PI_2;
+		theta_b=*theta_o+blockIdx.x*M_PI/359-M_PI_2;
 		float s;
 		float c;
 		__sincosf(theta_b, &s, &c);
 		//mapW/H is offset, 0.1f is resolution
-		x1=(int)floorf(mapW/2+x/resolution);
-		y1=(int)floorf(mapH/2+y/resolution);
+		x1=(int)floorf(mapW/2+*x_o/resolution);
+		y1=(int)floorf(mapH/2+*y_o/resolution);
 		//0.1f for wall thickness, if needed, add to range before mul
-		x2=(int)floorf(mapW/2+(x+(range+0.1f)*c)/resolution);
-		y2=(int)floorf(mapH/2+(y+(range+0.1f)*s)/resolution);
+		x2=(int)floorf(mapW/2+(*x_o +(*range+0.1f)*c)/resolution);
+		y2=(int)floorf(mapH/2+(*y_o +(*range+0.1f)*s)/resolution);
 		delta_x=(float)(x2-x1);
 		delta_y=(float)(y2-y1);
 		/*
@@ -88,7 +88,7 @@ __global__ void updateMapBresenham(float *map, size_t pitch, float *scan_gpu){
 		sign_delta_y=copysignf(1, delta_y);
 	}
 	__syncthreads();
-	if(range<range_max)
+	if(*range<range_max)
 	{
 		int current_x, current_y;
 		if(fabs(delta_y)>fabs(delta_x))
@@ -105,61 +105,182 @@ __global__ void updateMapBresenham(float *map, size_t pitch, float *scan_gpu){
 			current_y=y1+rintf(m*(current_x-x1));
             //current_y=y1+floorf(0.4999999f+m*(current_x-x1));
 		}
-		if(current_x>=0 && current_x<mapW && current_y>=0 && current_y<mapH)
-		{
-			//0.1f because going from grid (10cm cell) to meters
-			float d=hypotf(current_x-x1, current_y-y1)*resolution;
-			//divide by 100 because rmax is #of cells, ie 500->turn to meters
-			//float k=1-(d/rmax)*(d/rmax)/100;
-			//float k=1;
-            //float k=0.6;
-			//float s=0.00001425*range*range;
-			//float s=0.4;
-            //float s=0.6;
-			//float expon=((d-range)/s)*((d-range)/s);
-			float prob;
-
-			if(d<range)
-			{
-				//sensor model
-				//prob=0.3+(k/s*__frsqrt_rn(s)+0.2)*__expf(-0.5*expon);
-				if(d<1.0f)
-				prob=0.45f;
-				else
-				prob=0.45f+(d-1.0f)/6.4f*(0.5f-0.45f);
-			}
-			else
-			{
-				//sensor model
-				//prob=0.5+k/s*__frsqrt_rn(s)*__expf(-0.5*expon);
-					
-				if(d<1.0f)
-				prob=0.75f;
-				else
-				prob=0.75f+(d-1.0f)/6.4f*(0.5f-0.75f);
-					
-			}
-			//map[current_x+current_y*pitch]+=__logf(prob/(1-prob));
-				
-			if (d<=range+0.1f && d<=6.4f)
-			{
-				float pr=map[current_x+current_y*pitch];
-				if(pr==-1.0f)
-					pr=0.5f;
-				map[current_x+current_y*pitch]=1.0f-1.0f/(1.0f+prob/(1.0f-prob)*pr/(1.0f-pr));
-
-				//printf("-------------------------------------------------------------------updating map\n");  
-			}
-		}
-		else
-		{
-			//printf("%d %d\n", current_x, current_y); 
-		}
+		coords[0]=current_x;
+		coords[1]=current_y;
 	}
 	else
 	{
-		//printf("range: %d \n", range);
+		coords[0]=-1;
+		coords[1]=-1;
 	}
+	if(coords[0]>=0 && coords[0]<mapW && coords[1]>=0 && coords[1]<mapH)
+	{
+		coords[2]=hypotf(coords[0]-x1, coords[1]-y1)*resolution;
+	}
+	else
+	{
+		coords[2]=-1;
+	}
+}
+
+__global__ void updateMapBresenham(float *map, size_t pitch, float *scan_gpu, float x, float y, float theta){
+	__shared__ float range;
+	__shared__ int x1, y1, x2, y2;
+	__shared__ float delta_x, delta_y, m;
+	__shared__ int sign_delta_x, sign_delta_y;
+	__shared__ float theta_b;
+	float coords[3];
+	if(threadIdx.x==0)
+	{
+		range=scan_gpu[blockIdx.x];
+	}
+	getCoordsBresenham(coords, &range, &x, &y, &theta);
+	//printf("coords:%d %d\n", coords[0], coords[1]);
+	if(coords[2]>=0)
+	{
+		//0.1f because going from grid (10cm cell) to meters
+		float d=coords[2];
+		int current_x=(int)coords[0];
+		int current_y=(int)coords[1];
+		//divide by 100 because rmax is #of cells, ie 500->turn to meters
+		//float k=1-(d/rmax)*(d/rmax)/100;
+		//float k=1;
+        //float k=0.6;
+		//float s=0.00001425*range*range;
+		//float s=0.4;
+        //float s=0.6;
+		//float expon=((d-range)/s)*((d-range)/s);
+		float prob;
+
+		if(d<range)
+		{
+			//sensor model
+			//prob=0.3+(k/s*__frsqrt_rn(s)+0.2)*__expf(-0.5*expon);
+			if(d<1.0f)
+			prob=0.45f;
+			else
+			prob=0.45f+(d-1.0f)/6.4f*(0.5f-0.45f);
+		}
+		else
+		{
+			//sensor model
+			//prob=0.5+k/s*__frsqrt_rn(s)*__expf(-0.5*expon);
+					
+			if(d<1.0f)
+			prob=0.75f;
+			else
+			prob=0.75f+(d-1.0f)/6.4f*(0.5f-0.75f);
+					
+		}
+		//map[current_x+current_y*pitch]+=__logf(prob/(1-prob));
+				
+		if (d<=range+0.1f && d<=6.4f)
+		{
+			float pr=map[current_x+current_y*pitch];
+			if(pr==-1.0f)
+				pr=0.5f;
+			map[current_x+current_y*pitch]=1.0f-1.0f/(1.0f+prob/(1.0f-prob)*pr/(1.0f-pr));
+
+			//printf("-------------------------------------------------------------------updating map\n");  
+		}
+	}
+	//if(threadIdx.x==0)
+	//{
+	//	range=scan_gpu[blockIdx.x];
+	//	theta_b=theta+blockIdx.x*M_PI/359-M_PI_2;
+	//	float s;
+	//	float c;
+	//	__sincosf(theta_b, &s, &c);
+	//	//mapW/H is offset, 0.1f is resolution
+	//	x1=(int)floorf(mapW/2+x/resolution);
+	//	y1=(int)floorf(mapH/2+y/resolution);
+	//	//0.1f for wall thickness, if needed, add to range before mul
+	//	x2=(int)floorf(mapW/2+(x+(range+0.1f)*c)/resolution);
+	//	y2=(int)floorf(mapH/2+(y+(range+0.1f)*s)/resolution);
+	//	delta_x=(float)(x2-x1);
+	//	delta_y=(float)(y2-y1);
+	//	/*
+	//	sign_delta_x=1;
+	//	if(delta_x<0)sign_delta_x=-1;
+	//	sign_delta_y=1;
+	//	if(delta_y<0)sign_delta_y=-1;
+	//	*/
+	//	sign_delta_x=copysignf(1, delta_x);
+	//	sign_delta_y=copysignf(1, delta_y);
+	//}
+	//__syncthreads();
+	//if(range<range_max)
+	//{
+	//	int current_x, current_y;
+	//	if(fabs(delta_y)>fabs(delta_x))
+	//	{
+	//		m=delta_x/delta_y;
+	//		current_y=y1+sign_delta_y*threadIdx.x;
+	//		current_x=x1+rintf(m*(current_y-y1));
+ //           //current_x=x1+floorf(0.4999999f+m*(current_y-y1));
+	//	}
+	//	else
+	//	{
+	//		m=delta_y/delta_x;
+	//		current_x=x1+sign_delta_x*threadIdx.x;
+	//		current_y=y1+rintf(m*(current_x-x1));
+ //           //current_y=y1+floorf(0.4999999f+m*(current_x-x1));
+	//	}
+	//	if(current_x>=0 && current_x<mapW && current_y>=0 && current_y<mapH)
+	//	{
+	//		//0.1f because going from grid (10cm cell) to meters
+	//		float d=hypotf(current_x-x1, current_y-y1)*resolution;
+	//		//divide by 100 because rmax is #of cells, ie 500->turn to meters
+	//		//float k=1-(d/rmax)*(d/rmax)/100;
+	//		//float k=1;
+ //           //float k=0.6;
+	//		//float s=0.00001425*range*range;
+	//		//float s=0.4;
+ //           //float s=0.6;
+	//		//float expon=((d-range)/s)*((d-range)/s);
+	//		float prob;
+
+	//		if(d<range)
+	//		{
+	//			//sensor model
+	//			//prob=0.3+(k/s*__frsqrt_rn(s)+0.2)*__expf(-0.5*expon);
+	//			if(d<1.0f)
+	//			prob=0.45f;
+	//			else
+	//			prob=0.45f+(d-1.0f)/6.4f*(0.5f-0.45f);
+	//		}
+	//		else
+	//		{
+	//			//sensor model
+	//			//prob=0.5+k/s*__frsqrt_rn(s)*__expf(-0.5*expon);
+	//				
+	//			if(d<1.0f)
+	//			prob=0.75f;
+	//			else
+	//			prob=0.75f+(d-1.0f)/6.4f*(0.5f-0.75f);
+	//				
+	//		}
+	//		//map[current_x+current_y*pitch]+=__logf(prob/(1-prob));
+	//			
+	//		if (d<=range+0.1f && d<=6.4f)
+	//		{
+	//			float pr=map[current_x+current_y*pitch];
+	//			if(pr==-1.0f)
+	//				pr=0.5f;
+	//			map[current_x+current_y*pitch]=1.0f-1.0f/(1.0f+prob/(1.0f-prob)*pr/(1.0f-pr));
+
+	//			//printf("-------------------------------------------------------------------updating map\n");  
+	//		}
+	//	}
+	//	else
+	//	{
+	//		//printf("%d %d\n", current_x, current_y); 
+	//	}
+	//}
+	//else
+	//{
+	//	//printf("range: %d \n", range);
+	//}
 }
 //__global__ void __launch_bounds__(1024) updateMap(float x, float y, float theta, float* map, float* scan_gpu, size_t pitch, int mapW, int mapH, float rmax){
 //    __shared__ float scan[360];
@@ -471,16 +592,16 @@ int main(int argc, char** argv){
 		cudaEventCreate(&stop);
 		cudaEventRecord(start, 0);
         float* scan=scans[index];
-		float * x_h;
-		float * y_h;
-		float * theta_h;
-		checkCudaErrors(cudaMallocHost(&x_h, sizeof(float)));
+		float x_h;
+		float y_h;
+		float theta_h;
+		/*checkCudaErrors(cudaMallocHost(&x_h, sizeof(float)));
 		checkCudaErrors(cudaMallocHost(&y_h, sizeof(float)));
-		checkCudaErrors(cudaMallocHost(&theta_h, sizeof(float)));
-        *x_h=xs[index];
-        *y_h=ys[index];
-        *theta_h=thetas[index];
-		printf("position:%f %f %f\n", *x_h, *y_h, *theta_h);
+		checkCudaErrors(cudaMallocHost(&theta_h, sizeof(float)));*/
+        x_h=xs[index];
+        y_h=ys[index];
+        theta_h=thetas[index];
+		printf("position:%f %f %f\n", x_h, y_h, theta_h);
 		float *scan_gpu;
 		checkCudaErrors(cudaMalloc(&scan_gpu, sizeof(float)*numReadings));
 		checkCudaErrors(cudaMemcpy(scan_gpu, scan, numReadings*sizeof(float), cudaMemcpyHostToDevice));
@@ -490,15 +611,16 @@ int main(int argc, char** argv){
 		dim3 numThrU(numTU, numTU);
 		dim3 numBlU(numBU, numBU);
 		*/
-		checkCudaErrors(cudaMemcpyToSymbol(x, &x_h, sizeof(float)));
+		/*checkCudaErrors(cudaMemcpyToSymbol(x, &x_h, sizeof(float)));
 		checkCudaErrors(cudaMemcpyToSymbol(y, &y_h, sizeof(float)));
 		checkCudaErrors(cudaMemcpyToSymbol(theta, &theta_h, sizeof(float)));
+		*/
 		//updateMap<<<numBlU, numThrU>>>(x, y, theta*M_PI/180.0f, map, scan_gpu, pitch/sizeof(float), width, height, local_size);
-		updateMapBresenham<<<360, 256>>>(map, pitch/sizeof(float),scan_gpu);
+		updateMapBresenham<<<360, 256>>>(map, pitch/sizeof(float),scan_gpu, x_h, y_h, theta_h);
 		checkCudaErrors(cudaFree(scan_gpu));
-		checkCudaErrors(cudaFreeHost(x_h));
+		/*checkCudaErrors(cudaFreeHost(x_h));
 		checkCudaErrors(cudaFreeHost(y_h));
-		checkCudaErrors(cudaFreeHost(theta_h));
+		checkCudaErrors(cudaFreeHost(theta_h));*/
 		cudaEventRecord(stop, 0);
 		cudaEventSynchronize(stop);
 		cudaEventElapsedTime(&time, start, stop);
