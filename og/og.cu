@@ -123,12 +123,53 @@ __device__ void getCoordsBresenham(float *coords, float * range, float * x_o, fl
 	}
 }
 
+__global__ void computeMatchScores(float * x_part, float * y_part, float * theta_part, float * scan_gpu, float *map, size_t pitch, float * scores)
+{
+	__shared__ float range;
+	__shared__ float x;
+	__shared__ float y;
+	__shared__ float theta;
+	__shared__ float true_range;
+	__shared__ float computed_ranges[256];
+	float coords[3];
+	if(threadIdx.x==0)
+	{
+		range=range_max-0.0001f;
+		x=x_part[blockIdx.y];
+		y=y_part[blockIdx.y];
+		theta=theta_part[blockIdx.y];
+		true_range=scan_gpu[blockIdx.x];
+	}
+	__syncthreads();
+	getCoordsBresenham(coords, &range, &x, &y, &theta);
+	computed_ranges[threadIdx.x]=range_max;
+	if(coords[2]>=0.0f && map[(int)coords[0]+(int)coords[1]*pitch]>0.5f)
+		computed_ranges[threadIdx.x]=coords[2];
+	__syncthreads();
+	int threadsInB=blockDim.x;
+	while(threadsInB>1)
+	{
+		int halfTh=(threadsInB >> 1);
+		if(threadIdx.x<halfTh)
+		{
+			int thread2=threadIdx.x+halfTh;
+			float temp=computed_ranges[thread2];
+			if(temp<computed_ranges[threadIdx.x])
+				computed_ranges[threadIdx.x]=temp;
+		}
+		__syncthreads();
+		threadsInB=halfTh;
+	}
+	__syncthreads();
+	if(threadIdx.x==0)
+	{
+		float score=(true_range-computed_ranges[0])*(true_range-computed_ranges[0])/(true_range*computed_ranges[0]);
+		scores[blockIdx.x+blockIdx.y*gridDim.y]=score;
+	}
+}
+
 __global__ void updateMapBresenham(float *map, size_t pitch, float *scan_gpu, float x, float y, float theta){
 	__shared__ float range;
-	__shared__ int x1, y1, x2, y2;
-	__shared__ float delta_x, delta_y, m;
-	__shared__ int sign_delta_x, sign_delta_y;
-	__shared__ float theta_b;
 	float coords[3];
 	if(threadIdx.x==0)
 	{
