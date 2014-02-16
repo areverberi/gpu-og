@@ -2,9 +2,94 @@
 #include <stdio.h>
 #include "string.h"
 #include <stddef.h>
+#include <vector>
 #define _USE_MATH_DEFINES
 #include "math.h"
 #include "helper_cuda.h"
+#include<cuda.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/device_vector.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/fill.h>
+#include <thrust/sequence.h>
+#include <thrust/random.h>
+#include <thrust/device_ptr.h>
+#include <thrust/reduce.h>
+#include <thrust/sort.h>
+#include <thrust/scan.h>
+#include <thrust/binary_search.h>
+#include <thrust/gather.h>
+
+#define NUM_PARTICLES 1000
+#define PART_PER_THREAD 100
+#define ALPHA1 0.05f
+#define ALPHA2 0.057f
+#define ALPHA3 0.087f
+#define ALPHA4 0.05f
+
+typedef thrust::device_vector<float>::iterator floatIterator;
+typedef thrust::tuple<floatIterator, floatIterator, floatIterator> floatIterTuple;
+typedef thrust::zip_iterator<floatIterTuple> zipIteratorFloatTuple;
+
+struct pseudorgnorm
+{
+	float a,b;
+	__host__ __device__ pseudorgnorm(float _a=0.0f, float _b=1.0f): a(_a), b(_b) {};
+	__host__ __device__ float operator()(const unsigned int n)const
+	{
+		thrust::default_random_engine rng;
+		thrust::normal_distribution<float>dist(a,b);
+		rng.discard(n);
+		return dist(rng);
+	}
+};
+
+struct pseudorg
+{
+	float a,b;
+	__host__ __device__ pseudorg(float _a=0.0f, float _b=1.0f): a(_a), b(_b) {};
+	__host__ __device__ float operator()(const unsigned int n)const
+	{
+		thrust::default_random_engine rng;
+		thrust::uniform_real_distribution<float>dist(a,b);
+		rng.discard(n);
+		return dist(rng);
+	}
+};
+
+template <typename T> 
+struct lin_to_row_index : public thrust::unary_function<T, T>
+{
+	T C;
+	__host__ __device__ lin_to_row_index(T _C): C(_C) {}
+	__host__ __device__ T operator()(T i)
+	{
+		return i/C;
+	}
+};
+
+template <typename T> 
+struct cos_v : public thrust::unary_function<T, T>
+{
+	__host__ __device__ T operator()(T i)
+	{
+		return __cosf(i);
+	}
+};
+
+template <typename T> 
+struct sin_v : public thrust::unary_function<T, T>
+{
+	__host__ __device__ T operator()(T i)
+	{
+		return __sinf(i);
+	}
+};
 
 //texture <float, 2, cudaReadModeElementType> radius;
 //texture <float, 2, cudaReadModeElementType> angle;
@@ -18,6 +103,61 @@ __constant__ int mapH;
 __constant__ float resolution;
 __constant__ float range_max;
 
+__device__ float fatomicMin(float *addr, float value)
+{
+	float old = *addr, assumed;
+	if(old <= value) return old;
+	do
+	{
+		assumed = old;
+		old = atomicCAS((unsigned int*)addr, __float_as_int(assumed), __float_as_int(value));
+	}while(old!=assumed);
+	return old;
+}
+bool readLine(std::ifstream& file, std::vector<int>& numScans, std::vector<std::vector<float>>& scans, std::vector<float>& x, std::vector<float>& y, std::vector<float>& theta)
+{
+	std::string line_type;
+	file>>line_type;
+	if(line_type=="#" || line_type=="PARAM" || line_type=="ODOM" || line_type=="NEFF")
+	{
+		std::string skip;
+		std::getline(file, skip);
+		return true;
+	}
+	if(line_type=="FLASER")
+	{
+		int num;
+		file>>num;
+		numScans.push_back(num);
+		std::vector<float> scan(num);
+		for(unsigned int i=0; i<num; ++i)
+		{
+			float s;
+			file>>s;
+			scan.push_back(s);
+		}
+		scans.push_back(scan);
+		float t;
+		file>>t;
+		x.push_back(t);
+		file>>t;
+		y.push_back(t);
+		file>>t;
+		theta.push_back(t);
+		std::string rem;
+		std::getline(file, rem);
+		return true;
+	}
+	return false;
+}
+bool loadLog(std::string filename, std::vector<int>& numScans, std::vector<std::vector<float>>& scans, std::vector<float>& x, std::vector<float>& y, std::vector<float>& theta)
+{
+	std::ifstream file(filename.c_str());
+	if(!file.is_open())
+		return false;
+	while(readLine(file, numScans, scans, x, y, theta));
+	return true;
+}
 char* mystrsep(char** stringp, const char* delim)
 {
   char* start = *stringp;
@@ -37,11 +177,11 @@ char* mystrsep(char** stringp, const char* delim)
 
   return start;
 }
-__global__ void __launch_bounds__(1024) initMap(float* map, int w, int h, size_t pitch, int numX, int numY){
+__global__ void __launch_bounds__(1024) initMap(float* map, int w, int h, size_t pitch, int w_th, int h_th){
 	unsigned int idx=blockIdx.x*blockDim.x+threadIdx.x;
 	unsigned int idy=blockIdx.y*blockDim.y+threadIdx.y;
-	unsigned int w_th=w/(blockDim.x*gridDim.x);
-	unsigned int h_th=h/(blockDim.y*gridDim.y);
+	//unsigned int w_th=w/(blockDim.x*gridDim.x);
+	//unsigned int h_th=h/(blockDim.y*gridDim.y);
 	for(unsigned int i=0; i<h_th; ++i)
 	{
 		for(unsigned int j=0; j<w_th; ++j)
@@ -57,7 +197,7 @@ __global__ void __launch_bounds__(1024) initMap(float* map, int w, int h, size_t
     __syncthreads();
 }
 
-__device__ void getCoordsBresenham(float *coords, float * range, float * x_o, float * y_o, float * theta_o)
+__device__ void getCoordsBresenham(float *coords, float * range, float * x_o, float * y_o, float * theta_o, int coord_sys=0)
 {
 	__shared__ int x1, y1, x2, y2;
 	__shared__ float delta_x, delta_y, m;
@@ -90,18 +230,22 @@ __device__ void getCoordsBresenham(float *coords, float * range, float * x_o, fl
 	__syncthreads();
 	if(*range<range_max)
 	{
-		int current_x, current_y;
+		int current_x, current_y, pos;
+		if(coord_sys==0)
+			pos=threadIdx.x;
+		else
+			pos=blockIdx.y;
 		if(fabs(delta_y)>fabs(delta_x))
 		{
 			m=delta_x/delta_y;
-			current_y=y1+sign_delta_y*threadIdx.x;
+			current_y=y1+sign_delta_y*pos;
 			current_x=x1+rintf(m*(current_y-y1));
             //current_x=x1+floorf(0.4999999f+m*(current_y-y1));
 		}
 		else
 		{
 			m=delta_y/delta_x;
-			current_x=x1+sign_delta_x*threadIdx.x;
+			current_x=x1+sign_delta_x*pos;
 			current_y=y1+rintf(m*(current_x-x1));
             //current_y=y1+floorf(0.4999999f+m*(current_x-x1));
 		}
@@ -125,28 +269,32 @@ __device__ void getCoordsBresenham(float *coords, float * range, float * x_o, fl
 
 __global__ void computeMatchScores(float * x_part, float * y_part, float * theta_part, float * scan_gpu, float *map, size_t pitch, float * scores)
 {
-	__shared__ float range;
-	__shared__ float x;
-	__shared__ float y;
-	__shared__ float theta;
-	__shared__ float true_range;
-	__shared__ float computed_ranges[256];
-	float coords[3];
-	if(threadIdx.x==0)
-	{
-		range=range_max-0.0001f;
-		x=x_part[blockIdx.y];
-		y=y_part[blockIdx.y];
-		theta=theta_part[blockIdx.y];
-		true_range=scan_gpu[blockIdx.x];
-	}
-	__syncthreads();
-	getCoordsBresenham(coords, &range, &x, &y, &theta);
-	computed_ranges[threadIdx.x]=range_max;
-	if(coords[2]>=0.0f && map[(int)coords[0]+(int)coords[1]*pitch]>0.5f)
-		computed_ranges[threadIdx.x]=coords[2];
-	__syncthreads();
-	int threadsInB=blockDim.x;
+	//__shared__ float range;
+	////__shared__ float x;
+	////__shared__ float y;
+	////__shared__ float theta;
+	//__shared__ float true_range;
+	////__shared__ float computed_ranges[256];
+	//float coords[3];
+	//if(threadIdx.x==0)
+	//{
+	//	range=range_max-0.0001f;
+	//	//true_range=scan_gpu[blockIdx.x];
+	//}
+	//__syncthreads();
+	//for(int i=threadIdx.x*PART_PER_THREAD; i<threadIdx.x*PART_PER_THREAD+PART_PER_THREAD; ++i)
+	//{
+	//	float x=x_part[i];
+	//	float y=y_part[i];
+	//	float theta=theta_part[i];
+	//	getCoordsBresenham(coords, &range, &x, &y, &theta, 1);
+	//	if(coords[2]>=0.0f && map[(int)coords[0]+(int)coords[1]*pitch]>0.5f)
+	//	//computed_ranges[threadIdx.x]=coords[2];
+	//		fatomicMin(&scores[i], coords[2]);
+	//}
+	//__syncthreads();
+	//computed_ranges[threadIdx.x]=range_max;	
+	/*int threadsInB=blockDim.x;
 	while(threadsInB>1)
 	{
 		int halfTh=(threadsInB >> 1);
@@ -160,11 +308,35 @@ __global__ void computeMatchScores(float * x_part, float * y_part, float * theta
 		__syncthreads();
 		threadsInB=halfTh;
 	}
+	__syncthreads();*/
+	//if(threadIdx.x==0)
+	//{
+	//	//float score=(true_range-computed_ranges[0])*(true_range-computed_ranges[0])/(true_range*computed_ranges[0]);
+	//	float score=(true_range-computed_range)*(true_range-computed_range)/(true_range*computed_range);
+	//	scores[blockIdx.x+blockIdx.y*gridDim.y]=score;
+	//}
+	__shared__ float x,y,theta;
+	__shared__ unsigned int score;
+	if(threadIdx.x==0)
+	{
+		x=x_part[blockIdx.x];
+		y=y_part[blockIdx.x];
+		theta=theta_part[blockIdx.x];
+	}
+	__syncthreads();
+	float range=scan_gpu[threadIdx.x];
+	float theta_t=theta+threadIdx.x*M_PI/359-M_PI_2;
+	float s, c;
+	__sincosf(theta_t, &s, &c);
+	int x_hit=(int)floorf(mapW/2+(x+(range+0.1f)*c)/resolution);
+	int y_hit=(int)floorf(mapH/2+(y+(range+0.1f)*s)/resolution);
+	if(x_hit>=0 && x_hit<mapW && y_hit>=0 && y_hit<mapH)
+		if(map[x_hit+y_hit*pitch]>0.5f)
+			atomicInc(&score, 0);
 	__syncthreads();
 	if(threadIdx.x==0)
 	{
-		float score=(true_range-computed_ranges[0])*(true_range-computed_ranges[0])/(true_range*computed_ranges[0]);
-		scores[blockIdx.x+blockIdx.y*gridDim.y]=score;
+		scores[blockIdx.x]=(float)score;
 	}
 }
 
@@ -387,9 +559,9 @@ __global__ void updateMapBresenham(float *map, size_t pitch, float *scan_gpu, fl
 //}
 
 int main(int argc, char** argv){
-	float *r;
+	/*float *r;
 	float *a;
-	float *s_m;
+	float *s_m;*/
 	/*size of the matrix in cells*/
 	int local_size=500;
 	//int map_size=1000;
@@ -490,6 +662,18 @@ int main(int argc, char** argv){
 	dim3 numThr(32, 32);
 	dim3 numBlocks(width/numThr.x, height/numThr.y);
     initMap <<<numBlocks, numThr>>> (map, width, height, pitch/sizeof(float), 1, 1);
+	thrust::device_vector<float> delta_t_v(NUM_PARTICLES);
+	thrust::device_vector<float> delta_r1_v(NUM_PARTICLES);
+	thrust::device_vector<float> delta_r2_v(NUM_PARTICLES);
+	thrust::device_vector<float> temp(NUM_PARTICLES);
+	thrust::device_vector<float> x_part(NUM_PARTICLES);
+	thrust::device_vector<float> y_part(NUM_PARTICLES);
+	thrust::device_vector<float> theta_part(NUM_PARTICLES);
+	float * scanScores;
+	checkCudaErrors(cudaMalloc(&scanScores, NUM_PARTICLES*sizeof(float)));
+	thrust::device_ptr<float> weights(scanScores);
+	thrust::device_vector<float> resampling_vector(NUM_PARTICLES);
+	thrust::device_vector<int> resampled_indices(NUM_PARTICLES);
 	cudaError_t err=cudaGetLastError();
 	if (err != cudaSuccess) 
 		printf("Error: %s\n", cudaGetErrorString(err));
@@ -522,117 +706,135 @@ int main(int argc, char** argv){
 	checkCudaErrors(cudaBindTextureToArray(angle, a_gpu));
 	*/
 	/*loading the range readings from file*/
-	FILE *f;
-	f=fopen("fr079-sm.log", "r");
+	/*FILE *f;
+	f=fopen("fr079.log", "r");*/
 	float ares=2*M_PI/360.0f;
 	int numReadings=(int)(M_PI*2/ares);
 	//float amin=-M_PI;
 	float amin=0;
 	float areadmin=0.0f;
 	int astart=(int)((areadmin-amin)/ares);
-	float *xs=(float*)malloc(sizeof(float));
+	std::vector<int> numScans;
+	std::vector<std::vector<float>> scans;
+	std::vector<float> xs;
+	std::vector<float> ys;
+	std::vector<float> thetas;
+	bool open=loadLog("fr079.log", numScans, scans, xs, ys, thetas);
+	/*float *xs=(float*)malloc(sizeof(float));
 	float *ys=(float*)malloc(sizeof(float));
 	float *thetas=(float*)malloc(sizeof(float));
 	int *numScans=(int*)malloc(sizeof(float));
 	float **scans=(float**)malloc(sizeof(float*));
-	int iter=0;
-	int len=0;
-	if (f!=NULL){
-		char *buffer=(char*)malloc(4096*sizeof(char));
-		int line=0;
-		while(fgets(buffer, 4096, f)){
-			line++;
-			int numElem=-1;
-			sscanf(buffer, "FLASER %d", &numElem);
-			if (numElem==-1){
-				continue;
-			}
-			numElem+=11;
-			char **a;
-			char **res;
-			res=new char* [numElem];
-			for(a=res; (*a=mystrsep(&buffer, " "))!=NULL;){
-				if(**a!='\0')
-					if(++a>=&res[numElem])
-						break;
-			}
-			int i, j;
-			numScans[iter]=atoi(res[1]);
-			float *readings_f=(float*)malloc(numReadings*sizeof(float));
-			/*for(j=0; j<astart; j++){
-				readings_f[j]=-1.0;
-			}*/
-			for(i=2; i<2+atoi(res[1]); i++){
-				sscanf(res[i], "%f", &readings_f[i-2]);
-				//readings_f[astart+i-2]*=100;
-			}
-			float x=(float)atof(res[i]);
-			//float x=(float)atof(res[i])*10;
-			xs[iter]=x;
-			//float y=(float)atof(res[i+1])*10;
-			float y=(float)atof(res[i+1]);
-			ys[iter]=y;
-			float theta=(float)atof(res[i+2]);
-			thetas[iter]=theta;
-			scans[iter]=readings_f;
-			iter++;
-			float *xs_new=(float*)realloc(xs, (iter+1)*sizeof(float));
-			float *ys_new=(float*)realloc(ys, (iter+1)*sizeof(float));
-			float *thetas_new=(float*)realloc(thetas, (iter+1)*sizeof(float));
-			int *numScans_new=(int*)realloc(numScans, (iter+1)*sizeof(int));
-			float **scans_new=(float**)realloc(scans, (iter+1)*sizeof(float*));
-			if (xs_new!=NULL)
-				xs=xs_new;
-			else
-				printf("no xs");
-			if (ys_new!=NULL)
-				ys=ys_new;
-			else
-				printf("no ys");
-			if (thetas_new!=NULL)
-				thetas=thetas_new;
-			else
-				printf("no thetas");
-			if (scans_new!=NULL)
-				scans=scans_new;
-			if(numScans_new!=NULL)
-				numScans=numScans_new;
-			else
-				printf("no scans");
-			
-			buffer=(char*)malloc(4096*sizeof(char));
-		}
-		xs=(float*)realloc(xs, iter*sizeof(float));
-		ys=(float*)realloc(ys, iter*sizeof(float));
-		thetas=(float*)realloc(thetas, iter*sizeof(float));
-		numScans=(int*)realloc(numScans, iter*sizeof(int));
-		scans=(float**)realloc(scans, iter*sizeof(float*));
-		len=iter;
-		/*int j;
-		for(j=0; j<iter; j++){
-			printf("xs:%f\t", xs[j]);
-			printf("ys:%f\t", ys[j]);
-			printf("thetas:%f\n", thetas[j]);
-			int k;
-			for(k=0; k<numReadings; k++){
-				float * s=scans[j];
-				printf("%f\t", s[k]);
-			}
-			printf("\n");
-		}
-		printf("lines read:%d\n", line);
-		*/
-	}
+	*/
+	//int iter=0;
+	//int len=0;
+	//if (f!=NULL){
+	//	char *buffer=(char*)malloc(4096*sizeof(char));
+	//	int line=0;
+	//	while(fgets(buffer, 4096, f)){
+	//		line++;
+	//		int numElem=-1;
+	//		sscanf(buffer, "FLASER %d", &numElem);
+	//		if (numElem==-1){
+	//			continue;
+	//		}
+	//		numElem+=11;
+	//		char **a;
+	//		char **res;
+	//		res=new char* [numElem];
+	//		for(a=res; (*a=mystrsep(&buffer, " "))!=NULL;){
+	//			if(**a!='\0')
+	//				if(++a>=&res[numElem])
+	//					break;
+	//		}
+	//		int i, j;
+	//		numScans[iter]=atoi(res[1]);
+	//		float *readings_f=(float*)malloc(numReadings*sizeof(float));
+	//		/*for(j=0; j<astart; j++){
+	//			readings_f[j]=-1.0;
+	//		}*/
+	//		for(i=2; i<2+atoi(res[1]); i++){
+	//			sscanf(res[i], "%f", &readings_f[i-2]);
+	//			//readings_f[astart+i-2]*=100;
+	//		}
+	//		float x=(float)atof(res[i]);
+	//		//float x=(float)atof(res[i])*10;
+	//		xs[iter]=x;
+	//		//float y=(float)atof(res[i+1])*10;
+	//		float y=(float)atof(res[i+1]);
+	//		ys[iter]=y;
+	//		float theta=(float)atof(res[i+2]);
+	//		thetas[iter]=theta;
+	//		scans[iter]=readings_f;
+	//		iter++;
+	//		float *xs_new=(float*)realloc(xs, (iter+1)*sizeof(float));
+	//		float *ys_new=(float*)realloc(ys, (iter+1)*sizeof(float));
+	//		float *thetas_new=(float*)realloc(thetas, (iter+1)*sizeof(float));
+	//		int *numScans_new=(int*)realloc(numScans, (iter+1)*sizeof(int));
+	//		float **scans_new=(float**)realloc(scans, (iter+1)*sizeof(float*));
+	//		if (xs_new!=NULL)
+	//			xs=xs_new;
+	//		else
+	//			printf("no xs");
+	//		if (ys_new!=NULL)
+	//			ys=ys_new;
+	//		else
+	//			printf("no ys");
+	//		if (thetas_new!=NULL)
+	//			thetas=thetas_new;
+	//		else
+	//			printf("no thetas");
+	//		if (scans_new!=NULL)
+	//			scans=scans_new;
+	//		if(numScans_new!=NULL)
+	//			numScans=numScans_new;
+	//		else
+	//			printf("no scans");
+	//		
+	//		buffer=(char*)malloc(4096*sizeof(char));
+	//	}
+	//	xs=(float*)realloc(xs, iter*sizeof(float));
+	//	ys=(float*)realloc(ys, iter*sizeof(float));
+	//	thetas=(float*)realloc(thetas, iter*sizeof(float));
+	//	numScans=(int*)realloc(numScans, iter*sizeof(int));
+	//	scans=(float**)realloc(scans, iter*sizeof(float*));
+	//	len=iter;
+	//	/*int j;
+	//	for(j=0; j<iter; j++){
+	//		printf("xs:%f\t", xs[j]);
+	//		printf("ys:%f\t", ys[j]);
+	//		printf("thetas:%f\n", thetas[j]);
+	//		int k;
+	//		for(k=0; k<numReadings; k++){
+	//			float * s=scans[j];
+	//			printf("%f\t", s[k]);
+	//		}
+	//		printf("\n");
+	//	}
+	//	printf("lines read:%d\n", line);
+	//	*/
+	//}
 	int index;
 	float tot_time=0.0f;
-    for(index=0; index<len; index++){
+	float x_old=0.0f;
+	float y_old=0.0f;
+	float theta_old=0.0f;
+	float x_old_c=0.0f;
+	float y_old_c=0.0f;
+	float theta_old_c=0.0f;
+	printf("%d, %d\n",numScans.size(), open==0);
+    for(index=0; index<numScans.size(); index++){
 		/*taking one range reading at a time*/
-		cudaEvent_t start, stop;
+		cudaEvent_t start, stop, resample_time;
+		cudaEvent_t startScores, stopScores;
 		float time;
 		cudaEventCreate(&start);
 		cudaEventCreate(&stop);
+		cudaEventCreate(&resample_time);
+		cudaEventCreate(&startScores);
+		cudaEventCreate(&stopScores);
 		cudaEventRecord(start, 0);
-        float* scan=scans[index];
+        std::vector<float> scan=scans[index];
 		float x_h;
 		float y_h;
 		float theta_h;
@@ -645,7 +847,7 @@ int main(int argc, char** argv){
 		printf("position:%f %f %f\n", x_h, y_h, theta_h);
 		float *scan_gpu;
 		checkCudaErrors(cudaMalloc(&scan_gpu, sizeof(float)*numReadings));
-		checkCudaErrors(cudaMemcpy(scan_gpu, scan, numReadings*sizeof(float), cudaMemcpyHostToDevice));
+		checkCudaErrors(cudaMemcpy(scan_gpu, &scan[0], numReadings*sizeof(float), cudaMemcpyHostToDevice));
 		/*int numTU=32;
 		int numBU=(int)ceil((float)local_size/numTU);
 		printf("num blocks:%d\n", numBU);
@@ -657,8 +859,65 @@ int main(int argc, char** argv){
 		checkCudaErrors(cudaMemcpyToSymbol(theta, &theta_h, sizeof(float)));
 		*/
 		//updateMap<<<numBlU, numThrU>>>(x, y, theta*M_PI/180.0f, map, scan_gpu, pitch/sizeof(float), width, height, local_size);
-		updateMapBresenham<<<360, 256>>>(map, pitch/sizeof(float),scan_gpu, x_h, y_h, theta_h);
+		float delta_t=hypot(x_h-x_old, y_h-y_old);
+		float delta_r1=atan2(y_h-y_old, x_h-x_old);
+		float delta_r2=theta_h-theta_old-delta_r1;
+		float sigma_t=ALPHA3*delta_t+ALPHA4*(fabs(delta_r1)+fabs(delta_r2));
+		float sigma_r1=ALPHA1*fabs(delta_r1)+ALPHA2*delta_t;
+		float sigma_r2=ALPHA1*fabs(delta_r2)+ALPHA2*delta_t;
+		thrust::counting_iterator<unsigned int> rndSeed((int)start);
+		thrust::transform(rndSeed, rndSeed+NUM_PARTICLES, delta_t_v.begin(), pseudorgnorm(delta_t, sigma_t));
+		thrust::transform(rndSeed+NUM_PARTICLES, rndSeed+NUM_PARTICLES*2, delta_r1_v.begin(), pseudorgnorm(delta_r1, sigma_r1));
+		thrust::transform(rndSeed+NUM_PARTICLES*2, rndSeed+NUM_PARTICLES*3, delta_r2_v.begin(), pseudorgnorm(delta_r2, sigma_r2));
+		thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), delta_r2_v.begin(), theta_part.begin(), thrust::plus<float>());
+		thrust::constant_iterator<float> theta_const(theta_old_c);
+		thrust::transform(theta_const, theta_const+NUM_PARTICLES, theta_part.begin(), theta_part.begin(), thrust::plus<float>());
+		//thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), x_part.begin(), cos_v());
+		thrust::transform(delta_t_v.begin(), delta_t_v.end(), make_transform_iterator(delta_r1_v.begin(), cos_v<float>()), x_part.begin(), thrust::multiplies<float>());
+		thrust::constant_iterator<float> x_const(x_old_c);
+		thrust::transform(x_const, x_const+NUM_PARTICLES, x_part.begin(), x_part.begin(), thrust::plus<float>());
+		//thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), y_part.begin(), sin_v());
+		thrust::transform(delta_t_v.begin(), delta_t_v.end(), make_transform_iterator(delta_r1_v.begin(), sin_v<float>()), y_part.begin(), thrust::multiplies<float>());
+		thrust::constant_iterator<float> y_const(y_old_c);
+		thrust::transform(y_const, y_const+NUM_PARTICLES, y_part.begin(), y_part.begin(), thrust::plus<float>());
+		
+		float * x_part_kernel=thrust::raw_pointer_cast(&x_part[0]);
+		float * y_part_kernel=thrust::raw_pointer_cast(&y_part[0]);
+		float * theta_part_kernel=thrust::raw_pointer_cast(&theta_part[0]);
+		
+		dim3 blocksScores(numScans[index], 256);
+		//computeMatchScores<<<blocksScores, NUM_PARTICLES/PART_PER_THREAD >>>(x_part_kernel, y_part_kernel, theta_part_kernel, scan_gpu, map, pitch/sizeof(float), scanScores);
+		computeMatchScores<<<NUM_PARTICLES, numScans[index] >>>(x_part_kernel, y_part_kernel, theta_part_kernel, scan_gpu, map, pitch/sizeof(float), scanScores);
+		/*thrust::device_vector<float> weights(NUM_PARTICLES);
+		thrust::device_vector<float> scoreIndexes(NUM_PARTICLES);
+		thrust::reduce_by_key(thrust::make_transform_iterator(thrust::counting_iterator<int>(0), lin_to_row_index<int>(numScans[index])), thrust::make_transform_iterator(thrust::counting_iterator<int>(0)+numScans[index]*NUM_PARTICLES, lin_to_row_index<int>(numScans[index])), allScores, scoreIndexes.begin(), weights.begin(), thrust::equal_to<int>(), thrust::plus<float>());
+		checkCudaErrors(cudaFree(scanScores));
+		*/
+		float max_w=thrust::reduce(weights, weights+NUM_PARTICLES, -1.0f, thrust::maximum<float>());
+		thrust::constant_iterator<float> max_w_const(max_w);
+		thrust::transform(weights, weights+NUM_PARTICLES, max_w_const, weights, thrust::divides<float>());
+		/*thrust::constant_iterator<float> one_const(1.0f);
+		thrust::transform(one_const, one_const+NUM_PARTICLES, weights.begin(), weights.begin(), thrust::minus<float>());
+		*/
+		zipIteratorFloatTuple zipIter=thrust::make_zip_iterator(make_tuple(x_part.begin(), y_part.begin(), theta_part.begin()));
+		thrust::sort_by_key(weights, weights+NUM_PARTICLES, zipIter);
+		thrust::inclusive_scan(weights, weights+NUM_PARTICLES, weights);
+		cudaEventRecord(resample_time, 0);
+		thrust::counting_iterator<unsigned int> resampleSeed((unsigned int)resample_time);
+		
+		thrust::transform(resampleSeed, resampleSeed+NUM_PARTICLES, resampling_vector.begin(), pseudorg(0.0f, 1.0f));
+		thrust::lower_bound(weights, weights+NUM_PARTICLES, resampling_vector.begin(), resampling_vector.end(), resampled_indices.begin());
+		thrust::gather(resampled_indices.begin(), resampled_indices.end(), zipIter, zipIter);
+		float x_avg=thrust::reduce(x_part.begin(), x_part.end());
+		float y_avg=thrust::reduce(y_part.begin(), y_part.end());
+		float theta_avg=thrust::reduce(theta_part.begin(), theta_part.end());
+		x_avg/=NUM_PARTICLES;
+		y_avg/=NUM_PARTICLES;
+		theta_avg/=NUM_PARTICLES;
+		printf("computed position: %f %f %f\n", x_avg, y_avg, theta_avg);
+		updateMapBresenham<<<360, 256>>>(map, pitch/sizeof(float),scan_gpu, x_avg, y_avg, theta_avg);
 		checkCudaErrors(cudaFree(scan_gpu));
+		//checkCudaErrors(cudaFree(scanScores));
 		/*checkCudaErrors(cudaFreeHost(x_h));
 		checkCudaErrors(cudaFreeHost(y_h));
 		checkCudaErrors(cudaFreeHost(theta_h));*/
@@ -673,6 +932,12 @@ int main(int argc, char** argv){
 			printf("Error: %s\n", cudaGetErrorString(err));
 			return -1;
 		}
+		x_old=x_h;
+		y_old=y_h;
+		theta_old=theta_h;
+		x_old_c=x_avg;
+		y_old_c=y_avg;
+		theta_old_c=theta_avg;
 		if(index%100==0){
 			float *mapsave;
 			/*saving map at every iteration, just for testing purposes*/
@@ -710,7 +975,7 @@ int main(int argc, char** argv){
 	free(a);
 	free(s_m);
 	*/
-	float avg_time=tot_time/len;
+	float avg_time=tot_time/numScans.size();
 	printf("avg time:%f\n", avg_time);
 	getchar();
 }
