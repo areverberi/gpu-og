@@ -27,10 +27,15 @@
 
 #define NUM_PARTICLES 1000
 #define PART_PER_THREAD 100
-#define ALPHA1 0.05f
-#define ALPHA2 0.057f
-#define ALPHA3 0.087f
-#define ALPHA4 0.05f
+#define ALPHA1 0.2f
+#define ALPHA2 0.2f
+#define ALPHA3 0.2f
+#define ALPHA4 0.2f
+#define SRR 0.1f
+#define STR 0.1f
+#define SRT 0.1f
+#define STT 0.1f
+#define MAX_ICP_ITER 20
 
 typedef thrust::device_vector<float>::iterator floatIterator;
 typedef thrust::tuple<floatIterator, floatIterator, floatIterator> floatIterTuple;
@@ -62,6 +67,14 @@ struct pseudorg
 	}
 };
 
+struct diff_from_zero : public thrust::unary_function<float, bool>
+{
+	__host__ __device__ bool operator()(float v)
+	{
+		return v!=0.0f;
+	}
+};
+
 template <typename T> 
 struct lin_to_row_index : public thrust::unary_function<T, T>
 {
@@ -82,12 +95,66 @@ struct cos_v : public thrust::unary_function<T, T>
 	}
 };
 
+struct correctAngle : public thrust::unary_function<float, float>
+{
+	float modulo;
+	__host__ __device__ correctAngle(float _modulo): modulo(_modulo){}
+	__host__ __device__ float operator()(float i)
+	{
+		i=fmodf(i, modulo);
+		if(i>(modulo/2))
+			i-=modulo;
+		return i;
+	}
+};
 template <typename T> 
 struct sin_v : public thrust::unary_function<T, T>
 {
 	__host__ __device__ T operator()(T i)
 	{
 		return __sinf(i);
+	}
+};
+
+struct score_to_weight : public thrust::unary_function<float, float>
+{
+	float max_val;
+	__host__ __device__ score_to_weight(float _max_val): max_val(_max_val){}
+	__host__ __device__ float operator()(float i)
+	{
+		return exp(1/(0.075*NUM_PARTICLES)*(i-max_val));
+	}
+};
+
+struct angleDiff_v : public thrust::binary_function<float, float, float>
+{
+	__host__ __device__ float operator()(float a, float b)
+	{
+		float d1, d2;
+		a=atan2f(sinf(a), cosf(a));
+		b=atan2f(sinf(b), cosf(b));
+		d1=a-b;
+		d2=M_PI*2-fabs(d1);
+		if(d1>0)
+			d2*=-1.0;
+		if(fabs(d1)<fabs(d2))
+			return d1;
+		else 
+			return d2;
+	}
+};
+
+struct plusMod : public thrust::binary_function<float, float, float>
+{
+
+	float modulo;
+	__host__ __device__ plusMod(float _modulo): modulo(_modulo){}
+	__host__ __device__ float operator()(float a, float b)
+	{
+		float res=fmodf(a+b, modulo);
+		if(res>M_PI)
+			res-=2*M_PI;
+		return res;
 	}
 };
 
@@ -102,6 +169,129 @@ __constant__ int mapW;
 __constant__ int mapH;
 __constant__ float resolution;
 __constant__ float range_max;
+
+float normalizeAngle(float a)
+{
+	return atan2f(sinf(a), cosf(a));
+}
+
+void drawFromMotion(thrust::device_vector<float>& x_part, thrust::device_vector<float>& y_part, thrust::device_vector<float>& theta_part, float x_h, float y_h, float theta_h, float x_o, float y_o, float theta_o, int seed)
+{
+	float sxy=0.3*SRR;
+	float d_theta=normalizeAngle(theta_h-theta_o);
+	float s=sinf(theta_o); float c=cosf(theta_o);
+	float d_x=c*(x_h-x_o)+s*(y_h-y_o);
+	if(d_x<0)
+		printf("-----------------------------------------------------------------negative x\n");
+	float d_y=-s*(x_h-x_o)+c*(y_h-y_o);
+	float sigma_x=SRR*fabs(d_x)+STR*fabs(d_theta)+sxy*fabs(d_y);
+	float sigma_y=SRR*fabs(d_y)+STR*fabs(d_theta)+sxy*fabs(d_x);
+	float sigma_theta=STT*fabs(d_theta)+SRT*hypotf(d_x, d_y);
+	thrust::counting_iterator<unsigned int> rndSeed(seed);
+	thrust::device_vector<float> d_x_v(NUM_PARTICLES);
+	thrust::device_vector<float> d_y_v(NUM_PARTICLES);
+	thrust::device_vector<float> d_theta_v(NUM_PARTICLES);
+	thrust::transform(rndSeed, rndSeed+NUM_PARTICLES, d_x_v.begin(), pseudorgnorm(d_x, sigma_x));
+	thrust::transform(rndSeed+NUM_PARTICLES, rndSeed+NUM_PARTICLES*2, d_y_v.begin(), pseudorgnorm(d_y, sigma_y));
+	thrust::transform(rndSeed+NUM_PARTICLES*2, rndSeed+NUM_PARTICLES*3, d_theta_v.begin(), pseudorgnorm(d_theta, sigma_theta));
+	thrust::transform(d_theta_v.begin(), d_theta_v.end(), d_theta_v.begin(), correctAngle(2*M_PI));
+	thrust::transform_iterator<sin_v<float>, thrust::device_vector<float>::iterator> sin_iter(theta_part.begin(), sin_v<float>());
+	thrust::transform_iterator<cos_v<float>, thrust::device_vector<float>::iterator> cos_iter(theta_part.begin(), cos_v<float>());
+	thrust::device_vector<float> cosx(NUM_PARTICLES), sinx(NUM_PARTICLES), cosy(NUM_PARTICLES), siny(NUM_PARTICLES);
+	thrust::transform(d_x_v.begin(), d_x_v.end(), sin_iter, sinx.begin(), thrust::multiplies<float>());
+	thrust::transform(d_x_v.begin(), d_x_v.end(), cos_iter, cosx.begin(), thrust::multiplies<float>());
+	thrust::transform(d_y_v.begin(), d_y_v.end(), sin_iter, siny.begin(), thrust::multiplies<float>());
+	thrust::transform(d_y_v.begin(), d_y_v.end(), cos_iter, cosy.begin(), thrust::multiplies<float>());
+	thrust::transform(cosx.begin(), cosx.end(), siny.begin(), d_x_v.begin(), thrust::minus<float>());
+	thrust::transform(sinx.begin(), sinx.end(), cosy.begin(), d_y_v.begin(), thrust::plus<float>());
+	thrust::transform(x_part.begin(), x_part.end(), d_x_v.begin(), x_part.begin(), thrust::plus<float>());
+	thrust::transform(y_part.begin(), y_part.end(), d_y_v.begin(), y_part.begin(), thrust::plus<float>());
+	thrust::transform(theta_part.begin(), theta_part.end(), d_theta_v.begin(), theta_part.begin(), thrust::plus<float>());
+}
+
+struct gt: public thrust::binary_function<float, float, int>
+{
+	__host__ __device__ int operator()(float a, float b)
+	{
+		int res=a>b?0:1;
+		return res;
+	}
+};
+//void ICPStep(float * scores, int * scores_mask, thrust::device_vector<float> & new_x_part, thrust::device_vector<float> & new_y_part, thrust::device_vector<float> & new_theta_part, float * map, thrust::device_vector<float> & x_part, thrust::device_vector<float> & y_part, thrust::device_vector<float> & theta_part, float * scan_gpu, thrust::device_vector<float> & likelihood, bool score_only)
+//{
+//	thrust::device_vector<float> x_b(360*NUM_PARTICLES), y_b(360*NUM_PARTICLES), x_p_n(360*NUM_PARTICLES), y_p_n(360*NUM_PARTICLES);
+//	thrust::device_vector<int> stencil(360*NUM_PARTICLES);
+//	<<<360, NUM_PARTICLES>>> ICPStepKernel(scores, scores_mask, thrust::raw_pointer_cast(&x_p_n[0]), thrust::raw_pointer_cast(&y_p_n[0]), thrust::raw_pointer_cast(&stencil[0]), map, trust::raw_pointer_cast(&x_part[0]), trust::raw_pointer_cast(&y_part[0]), trust::raw_pointer_cast(&theta_part[0]), thrust::raw_pointer_cast(&x_b[0]), thrust::raw_pointer_cast(&y_b[0]), scan_gpu, trust::raw_pointer_cast(likelihood), scoreOnly);
+//	if(!score_only)
+//	{
+//		thrust::counting_iterator<int> part_index(0);
+//		thrust::device_vector<int> row_index(360*NUM_PARTICLES);
+//		thrust::device_vector<int> r(NUM_PARTICLES);
+//		thrust::sequence(row_index.begin(), row_index.end(), 0);
+//		thrust::transform(row_index.begin(), row_index.end(), row_index.begin(), lin_to_row_index<int>(360));
+//		thrust::zip_iterator<thrust::tuple<thrust::device_vector<int>::iterator, thrust::device_vector<float>::iterator, thrust::device_vector<float>::iterator, thrust::device_vector<float>::iterator, thrust::device_vector<float>::iterator>> part_zip_iter=thrust::make_zip_iterator(thrust::make_tuple(row_index.begin(), x_b.begin(), y_b.begin(), x_p_n.begin(), y_p_n.begin()));
+//		thrust::zip_iterator<thrust::tuple<thrust::device_vector<int>::iterator, thrust::device_vector<float>::iterator, thrust::device_vector<float>::iterator, thrust::device_vector<float>::iterator, thrust::device_vector<float>::iterator>> part_zip_iter_end=part_zip_iter+360*NUM_PARTICLES;
+//		part_zip_iter_end=thrust::remove_if(part_zip_iter, part_zip_iter_end, stencil.begin(), thrust::identity<int>());
+//		int distance=part_zip_iter_end-part_zip_iter;
+//		thrust::device_vector<float> x_b_avg(NUM_PARTICLES);
+//		thrust::reduce_by_key(row_index.begin(), row_index.begin()+distance, x_b.begin(), r.begin(), x_b_avg.begin(), thrust::equal_to<int>(), thrust::plus<float>());
+//		thrust::transform(x_b_avg.begin(), x_b_avg.end(), 
+//		thrust::device_vector<float> y_b_avg(NUM_PARTICLES);
+//		thrust::reduce_by_key(row_index.begin(), row_index.begin()+distance, y_b.begin(), r.begin(), y_b_avg.begin(), thrust::equal_to<int>(), thrust::plus<float>());
+//		thrust::device_vector<float> x_p_n_avg(NUM_PARTICLES);
+//		thrust::reduce_by_key(row_index.begin(), row_index.begin()+distance, x_p_n.begin(), r.begin(), x_p_n_avg.begin(), thrust::equal_to<int>(), thrust::plus<float>());
+//		thrust::device_vector<float> y_p_n_avg(NUM_PARTICLES);
+//		thrust::reduce_by_key(row_index.begin(), row_index.begin()+distance, y_p_n.begin(), r.begin(), y_p_n_avg.begin(), thrust::equal_to<int>(), thrust::plus<float>());
+//
+//
+//
+//	}
+//}
+//thrust::device_vector<float> & ICP(thrust::device_vector<float>& new_x_part,thrust::device_vector<float>& new_y_part,thrust::device_vector<float>& new_theta_part, float * map, thrust::device_vector<float>& x_part, thrust::device_vector<float>& y_part, thrust::device_vector<float>& theta_part, float * scan_gpu, thrust::device_vector<float>& likelihood)
+//{
+//	thrust::device_vector<float> sc(NUM_PARTICLES);
+//	thrust::device_vector<float> cur_sc(NUM_PARTICLES);
+//	thrust::fill(cur_sc.begin(), cur_sc.end(), 0.0f);
+//	thrust::device_vector<int> sc_mask(NUM_PARTICLES);
+//	thrust::device_vector<float> start_x(NUM_PARTICLES);
+//	thrust::device_vector<float> start_y(NUM_PARTICLES);
+//	thrust::device_vector<float> start_theta(NUM_PARTICLES);
+//	thrust::fill(sc_mask.begin(), sc_mask.end(), 0);
+//	ICPStep(thrust::raw_pointer_cast(&sc[0]), thrust::raw_pointer_cast(&sc_mask[0]),new_x_part,  new_y_part, new_theta_part, map, x_part, y_part, theta_part, scan_gpu, likelihood, true);
+//	int iter=0;
+//	thrust::copy(x_part.begin(), x_part.end(), start_x.begin());
+//	thrust::copy(y_part.begin(), y_part.end(), start_y.begin());
+//	thrust::copy(theta_part.begin(), theta_part.end(), start_theta.begin());
+//	int num_finished=0;
+//	do
+//	{
+//		thrust::copy(sc.begin(), sc.end(), cur_sc.begin());
+//		thrust::fill(sc.begin(), sc.end(), 0.0f);
+//		ICPStep(thrust::raw_pointer_cast(&sc[0]), thrust::raw_pointer_cast(&sc_mask[0]), new_x_part, new_y_part, new_theta_part, map, start_x, start_y, start_theta, scan_gpu, likelihood, false);
+//		thrust::transform(sc.begin(), sc.end(), cur_sc.begin(), sc_mask.begin(), gt());
+//		num_finished=thrust::reduce(sc_mask.begin(), sc_mask.end());
+//		thrust::copy(new_x_part.begin(), new_x_part.end(), start_x.begin());
+//		thrust::copy(new_y_part.begin(), new_y_part.end(), start_y.begin());
+//		thrust::copy(new_theta_part.begin(), new_theta_part.end(), start_theta.begin());
+//		++iter;
+//	}while(num_finished<NUM_PARTICLES && iter<MAX_ICP_ITER);
+//	return cur_sc;
+//}
+
+float angleDiff(float a, float b)
+{
+	float d1, d2;
+	a=normalizeAngle(a);
+	b=normalizeAngle(b);
+	d1=a-b;
+	d2=M_PI*2-fabs(d1);
+	if(d1>0)
+		d2*=-1.0;
+	if(fabs(d1)<fabs(d2))
+		return d1;
+	else 
+		return d2;
+}
 
 __device__ float fatomicMin(float *addr, float value)
 {
@@ -129,7 +319,7 @@ bool readLine(std::ifstream& file, std::vector<int>& numScans, std::vector<std::
 		int num;
 		file>>num;
 		numScans.push_back(num);
-		std::vector<float> scan(num);
+		std::vector<float> scan;
 		for(unsigned int i=0; i<num; ++i)
 		{
 			float s;
@@ -177,7 +367,7 @@ char* mystrsep(char** stringp, const char* delim)
 
   return start;
 }
-__global__ void __launch_bounds__(1024) initMap(float* map, int w, int h, size_t pitch, int w_th, int h_th){
+__global__ void initMap(float* map, int w, int h, size_t pitch, int w_th, int h_th){
 	unsigned int idx=blockIdx.x*blockDim.x+threadIdx.x;
 	unsigned int idy=blockIdx.y*blockDim.y+threadIdx.y;
 	//unsigned int w_th=w/(blockDim.x*gridDim.x);
@@ -316,23 +506,61 @@ __global__ void computeMatchScores(float * x_part, float * y_part, float * theta
 	//	scores[blockIdx.x+blockIdx.y*gridDim.y]=score;
 	//}
 	__shared__ float x,y,theta;
-	__shared__ unsigned int score;
+	__shared__ float score;
 	if(threadIdx.x==0)
 	{
 		x=x_part[blockIdx.x];
 		y=y_part[blockIdx.x];
 		theta=theta_part[blockIdx.x];
+		score=0;
 	}
 	__syncthreads();
 	float range=scan_gpu[threadIdx.x];
-	float theta_t=theta+threadIdx.x*M_PI/359-M_PI_2;
-	float s, c;
-	__sincosf(theta_t, &s, &c);
-	int x_hit=(int)floorf(mapW/2+(x+(range+0.1f)*c)/resolution);
-	int y_hit=(int)floorf(mapH/2+(y+(range+0.1f)*s)/resolution);
+	bool found=false;
+	float minDist;
+	if (range<6.4f)
+	{
+		float theta_t=theta+threadIdx.x*M_PI/360-M_PI_2;
+		float s, c;
+		__sincosf(theta_t, &s, &c);
+		int x_hit=(int)floorf(mapW/2+(x+(range+0.1f)*c)/resolution);
+		int y_hit=(int)floorf(mapH/2+(y+(range+0.1f)*s)/resolution);
+
+		for(int i=-2; i<=2; ++i)
+		{
+			for(int j=-2; j<=2; ++j)
+			{
+				int x_hit_k=x_hit+i;
+				int y_hit_k=y_hit+j;
+				if(x_hit>=0 && x_hit<mapW && y_hit>=0 && y_hit<mapH && x_hit_k>=0 && x_hit_k<mapW && y_hit_k>=0 && y_hit_k<mapH)
+					if(map[x_hit_k+y_hit_k*pitch]>0.5f)
+					{
+						if(!found)
+						{
+							minDist=i*i+j*j;
+							found=true;
+						}
+						else
+						{
+							float dist=i*i+j*j;
+							minDist=dist<minDist?dist:minDist;
+						}
+					}
+			}
+		} 
+	}
+	float pt_score=found?-minDist/0.075f:-0.5f/0.075f;
+	/*if(minDist==0.0f && found)
+		printf("mindist is 0\n");
+	*/if(found)
+		atomicAdd(&score, pt_score);
+	else
+		atomicAdd(&score, pt_score);
+	/*
 	if(x_hit>=0 && x_hit<mapW && y_hit>=0 && y_hit<mapH)
 		if(map[x_hit+y_hit*pitch]>0.5f)
 			atomicInc(&score, 0);
+			*/
 	__syncthreads();
 	if(threadIdx.x==0)
 	{
@@ -650,7 +878,7 @@ int main(int argc, char** argv){
 	/*map initialization and texture binding*/
     int width=map_size;
     int height=map_size;
-	float res=0.025f;
+	float res=0.05f;
 	float rmax=50.0f;
     float* map;
     size_t pitch;
@@ -816,9 +1044,12 @@ int main(int argc, char** argv){
 	//}
 	int index;
 	float tot_time=0.0f;
-	float x_old=0.0f;
-	float y_old=0.0f;
-	float theta_old=0.0f;
+	float x_old=xs[0];
+	float y_old=ys[0];
+	float theta_old=thetas[0];
+	thrust::fill(x_part.begin(), x_part.end(), x_old);
+	thrust::fill(y_part.begin(), y_part.end(), y_old);
+	thrust::fill(theta_part.begin(), theta_part.end(), theta_old);
 	float x_old_c=0.0f;
 	float y_old_c=0.0f;
 	float theta_old_c=0.0f;
@@ -848,6 +1079,7 @@ int main(int argc, char** argv){
 		float *scan_gpu;
 		checkCudaErrors(cudaMalloc(&scan_gpu, sizeof(float)*numReadings));
 		checkCudaErrors(cudaMemcpy(scan_gpu, &scan[0], numReadings*sizeof(float), cudaMemcpyHostToDevice));
+		drawFromMotion(x_part, y_part, theta_part, x_h, y_h, theta_h, x_old, y_old, theta_old, (int)start);
 		/*int numTU=32;
 		int numBU=(int)ceil((float)local_size/numTU);
 		printf("num blocks:%d\n", numBU);
@@ -859,28 +1091,120 @@ int main(int argc, char** argv){
 		checkCudaErrors(cudaMemcpyToSymbol(theta, &theta_h, sizeof(float)));
 		*/
 		//updateMap<<<numBlU, numThrU>>>(x, y, theta*M_PI/180.0f, map, scan_gpu, pitch/sizeof(float), width, height, local_size);
-		float delta_t=hypot(x_h-x_old, y_h-y_old);
-		float delta_r1=atan2(y_h-y_old, x_h-x_old);
-		float delta_r2=theta_h-theta_old-delta_r1;
-		float sigma_t=ALPHA3*delta_t+ALPHA4*(fabs(delta_r1)+fabs(delta_r2));
-		float sigma_r1=ALPHA1*fabs(delta_r1)+ALPHA2*delta_t;
-		float sigma_r2=ALPHA1*fabs(delta_r2)+ALPHA2*delta_t;
-		thrust::counting_iterator<unsigned int> rndSeed((int)start);
-		thrust::transform(rndSeed, rndSeed+NUM_PARTICLES, delta_t_v.begin(), pseudorgnorm(delta_t, sigma_t));
-		thrust::transform(rndSeed+NUM_PARTICLES, rndSeed+NUM_PARTICLES*2, delta_r1_v.begin(), pseudorgnorm(delta_r1, sigma_r1));
-		thrust::transform(rndSeed+NUM_PARTICLES*2, rndSeed+NUM_PARTICLES*3, delta_r2_v.begin(), pseudorgnorm(delta_r2, sigma_r2));
-		thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), delta_r2_v.begin(), theta_part.begin(), thrust::plus<float>());
-		thrust::constant_iterator<float> theta_const(theta_old_c);
-		thrust::transform(theta_const, theta_const+NUM_PARTICLES, theta_part.begin(), theta_part.begin(), thrust::plus<float>());
-		//thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), x_part.begin(), cos_v());
-		thrust::transform(delta_t_v.begin(), delta_t_v.end(), make_transform_iterator(delta_r1_v.begin(), cos_v<float>()), x_part.begin(), thrust::multiplies<float>());
-		thrust::constant_iterator<float> x_const(x_old_c);
-		thrust::transform(x_const, x_const+NUM_PARTICLES, x_part.begin(), x_part.begin(), thrust::plus<float>());
-		//thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), y_part.begin(), sin_v());
-		thrust::transform(delta_t_v.begin(), delta_t_v.end(), make_transform_iterator(delta_r1_v.begin(), sin_v<float>()), y_part.begin(), thrust::multiplies<float>());
-		thrust::constant_iterator<float> y_const(y_old_c);
-		thrust::transform(y_const, y_const+NUM_PARTICLES, y_part.begin(), y_part.begin(), thrust::plus<float>());
-		
+		/*float delta_theta=atan2(sinf(y_h-y_old), cos(x_h-x_old));
+		float s=sinf(theta_old);
+		float c=cosf(theta_old);
+		float delta_x=c*(x_h-x_old)+s*(y_h-y_old);
+		float delta_y=-s*(x_h-x_old)+c*(y_h-y_old);
+		float srr=0.01f;
+		float sxy=0.3f*srr;
+		float str=0.01;
+		float srt=0.01;
+		float stt=0.01;
+		float sigma_x=srr*fabs(delta_x)+str*fabs(delta_theta)+sxy*fabs(delta_y);
+		float sigma_y=srr*fabs(delta_y)+str*fabs(delta_theta)+sxy*fabs(delta_x);
+		float sigma_theta=stt*fabs(delta_theta)+srt*hypot(delta_x, delta_y);
+		*/
+		//float delta_r1=angleDiff(atan2(y_h-y_old, x_h-x_old),theta_old);
+		//float delta_r1_s=std::min(fabs(angleDiff(delta_r1, 0.0)), fabs(angleDiff(delta_r1, M_PI)));
+		//float delta_t=hypot(x_h-x_old, y_h-y_old);
+		//float delta_r2=angleDiff(angleDiff(theta_h,theta_old),delta_r1);
+		//float delta_r2_s=std::min(fabs(angleDiff(delta_r2, 0.0)), fabs(angleDiff(delta_r2, M_PI)));
+		//float sigma_t=ALPHA3*delta_t*delta_t+ALPHA4*(delta_r1_s*delta_r1_s+delta_r2_s*delta_r2_s);
+		//float sigma_r1=ALPHA1*delta_r1_s*delta_r1_s+ALPHA2*delta_t*delta_t;
+		//float sigma_r2=ALPHA1*delta_r2_s*delta_r2_s+ALPHA2*delta_t*delta_t;
+		//thrust::counting_iterator<unsigned int> rndSeed((int)start);
+		//thrust::transform(rndSeed, rndSeed+NUM_PARTICLES, delta_t_v.begin(), pseudorgnorm(0.0f, sigma_t));
+		//thrust::transform(rndSeed+NUM_PARTICLES, rndSeed+NUM_PARTICLES*2, delta_r1_v.begin(), pseudorgnorm(0.0f, sigma_r1));
+		//thrust::transform(rndSeed+NUM_PARTICLES*2, rndSeed+NUM_PARTICLES*3, delta_r2_v.begin(), pseudorgnorm(0.0f, sigma_r2));
+		//thrust::constant_iterator<float> delta_t_const(delta_t);
+		//thrust::constant_iterator<float> delta_r1_const(delta_r1);
+		//thrust::constant_iterator<float> delta_r2_const(delta_r2);
+		//thrust::transform(delta_t_const, delta_t_const+NUM_PARTICLES, delta_t_v.begin(), delta_t_v.begin(), thrust::minus<float>());
+		//thrust::transform(delta_r1_const, delta_r1_const+NUM_PARTICLES, delta_r1_v.begin(), delta_r1_v.begin(), angleDiff_v());
+		//thrust::transform(delta_r2_const, delta_r2_const+NUM_PARTICLES, delta_r2_v.begin(), delta_r2_v.begin(), angleDiff_v());
+		////theta+delta_r1
+		//thrust::transform(theta_part.begin(), theta_part.end(), delta_r1_v.begin(), delta_r1_v.begin(), thrust::plus<float>());
+		////thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), x_part.begin(), cos_v());
+		////delta_t*cos(delta_r1+theta)
+		//thrust::transform(delta_t_v.begin(), delta_t_v.end(), make_transform_iterator(delta_r1_v.begin(), cos_v<float>()), temp.begin(), thrust::multiplies<float>());
+		////x+delta_t*cos(delta_r1+theta)
+		//thrust::transform(temp.begin(), temp.end(), x_part.begin(), x_part.begin(), thrust::plus<float>());
+		////thrust::constant_iterator<float> x_const(x_old_c);
+		////thrust::transform(x_const, x_const+NUM_PARTICLES, x_part.begin(), x_part.begin(), thrust::plus<float>());
+		////thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), y_part.begin(), sin_v());
+		////delta_t*sin(delta_r1+theta)
+		//thrust::transform(delta_t_v.begin(), delta_t_v.end(), make_transform_iterator(delta_r1_v.begin(), sin_v<float>()), temp.begin(), thrust::multiplies<float>());
+		////y+delta_t*sin(delta_r1+theta)
+		//thrust::transform(temp.begin(), temp.end(), y_part.begin(), y_part.begin(), thrust::plus<float>());
+		///*thrust::constant_iterator<float> y_const(y_old_c);
+		//thrust::transform(y_const, y_const+NUM_PARTICLES, y_part.begin(), y_part.begin(), thrust::plus<float>());
+		//*/
+		////(theta+delta_r1)+delta_r2
+		//thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), delta_r2_v.begin(), theta_part.begin(), plusMod(M_PI*2));
+		//
+		//thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), delta_r2_v.begin(), theta_part.begin(), thrust::plus<float>());
+		/*thrust::constant_iterator<float> theta_const(theta_old_c);
+		thrust::transform(theta_const, theta_const+NUM_PARTICLES, theta_part.begin(), theta_part.begin(), thrust::plus<float>());*/
+		//thrust::transform(theta_const, theta_const+NUM_PARTICLES, delta_r1_v.begin(), delta_r1_v.begin(), thrust::plus<float>());
+		/*
+		thrust::device_vector<float> delta_x_v(NUM_PARTICLES);
+		thrust::device_vector<float> delta_y_v(NUM_PARTICLES);
+		thrust::device_vector<float> delta_theta_v(NUM_PARTICLES);
+		thrust::transform(rndSeed, rndSeed+NUM_PARTICLES, delta_x_v.begin(), pseudorgnorm(delta_x, sigma_x));
+		thrust::transform(rndSeed+NUM_PARTICLES, rndSeed+NUM_PARTICLES*2, delta_y_v.begin(), pseudorgnorm(delta_y, sigma_y));
+		thrust::transform(rndSeed+NUM_PARTICLES*2, rndSeed+NUM_PARTICLES*3, delta_theta_v.begin(), pseudorgnorm(delta_theta, sigma_theta));
+		thrust::transform(delta_theta_v.begin(), delta_theta_v.end(), delta_theta_v.begin(), correctAngle(2*M_PI));
+		thrust::transform(x_part.begin(), x_part.end(), delta_x_v.begin(), x_part.begin(), thrust::plus<float>());
+		thrust::transform(y_part.begin(), y_part.end(), delta_y_v.begin(), y_part.begin(), thrust::plus<float>());
+		thrust::transform(theta_part.begin(), theta_part.end(), delta_theta_v.begin(), theta_part.begin(), thrust::plus<float>());
+		*/
+		//float delta_t=hypot(x_h-x_old, y_h-y_old);
+		//float delta_r1;
+		//if(delta_t<0.01f)
+		//	delta_r1=0.0f;
+		//else
+		//	delta_r1=angleDiff(atan2(y_h-y_old, x_h-x_old),theta_old);
+		//delta_r1=std::min(fabs(angleDiff(delta_r1, 0.0)), fabs(angleDiff(delta_r1, M_PI)));
+		//float delta_r2=angleDiff(angleDiff(theta_h,theta_old),delta_r1);
+		//delta_r2=std::min(fabs(angleDiff(delta_r2, 0.0)), fabs(angleDiff(delta_r2, M_PI)));
+		//float sigma_t=ALPHA3*delta_t*delta_t+ALPHA4*(delta_r1*delta_r1+delta_r2*delta_r2);
+		//float sigma_r1=ALPHA1*delta_r1*delta_r1+ALPHA2*delta_t*delta_t;
+		//float sigma_r2=ALPHA1*delta_r2*delta_r2+ALPHA2*delta_t*delta_t;
+		//printf("deltas: %f %f %f\n sigmas:%f %f %f\n", delta_t, delta_r1, delta_r2, sigma_t, sigma_r1, sigma_r2);
+		//thrust::counting_iterator<unsigned int> rndSeed((int)start);
+		//thrust::transform(rndSeed, rndSeed+NUM_PARTICLES, delta_t_v.begin(), pseudorgnorm(0.0f, sigma_t));
+		//thrust::transform(rndSeed+NUM_PARTICLES, rndSeed+NUM_PARTICLES*2, delta_r1_v.begin(), pseudorgnorm(0.0f, sigma_r1));
+		//thrust::transform(rndSeed+NUM_PARTICLES*2, rndSeed+NUM_PARTICLES*3, delta_r2_v.begin(), pseudorgnorm(0.0f, sigma_r2));
+		//thrust::constant_iterator<float> delta_t_const(delta_t);
+		//thrust::constant_iterator<float> delta_r1_const(delta_r1);
+		//thrust::constant_iterator<float> delta_r2_const(delta_r2);
+		//thrust::transform(delta_t_const, delta_t_const+NUM_PARTICLES, delta_t_v.begin(), delta_t_v.begin(), thrust::minus<float>());
+		//thrust::transform(delta_r1_const, delta_r1_const+NUM_PARTICLES, delta_r1_v.begin(), delta_r1_v.begin(), angleDiff_v());
+		//thrust::transform(delta_r2_const, delta_r2_const+NUM_PARTICLES, delta_r2_v.begin(), delta_r2_v.begin(), angleDiff_v());
+		////theta+delta_r1
+		//thrust::transform(theta_part.begin(), theta_part.end(), delta_r1_v.begin(), delta_r1_v.begin(), thrust::plus<float>());
+		////thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), x_part.begin(), cos_v());
+		////delta_t*cos(delta_r1+theta)
+		//thrust::transform(delta_t_v.begin(), delta_t_v.end(), make_transform_iterator(delta_r1_v.begin(), cos_v<float>()), temp.begin(), thrust::multiplies<float>());
+		////x+delta_t*cos(delta_r1+theta)
+		//thrust::transform(temp.begin(), temp.end(), x_part.begin(), x_part.begin(), thrust::plus<float>());
+		////thrust::constant_iterator<float> x_const(x_old_c);
+		////thrust::transform(x_const, x_const+NUM_PARTICLES, x_part.begin(), x_part.begin(), thrust::plus<float>());
+		////thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), y_part.begin(), sin_v());
+		////delta_t*sin(delta_r1+theta)
+		//thrust::transform(delta_t_v.begin(), delta_t_v.end(), make_transform_iterator(delta_r1_v.begin(), sin_v<float>()), temp.begin(), thrust::multiplies<float>());
+		////y+delta_t*sin(delta_r1+theta)
+		//thrust::transform(temp.begin(), temp.end(), y_part.begin(), y_part.begin(), thrust::plus<float>());
+		///*thrust::constant_iterator<float> y_const(y_old_c);
+		//thrust::transform(y_const, y_const+NUM_PARTICLES, y_part.begin(), y_part.begin(), thrust::plus<float>());
+		//*/
+		////(theta+delta_r1)+delta_r2
+		//thrust::transform(delta_r1_v.begin(), delta_r1_v.end(), delta_r2_v.begin(), theta_part.begin(), plusMod(M_PI*2));
+		///*thrust::constant_iterator<float> theta_const(theta_old_c);
+		//thrust::transform(theta_const, theta_const+NUM_PARTICLES, theta_part.begin(), theta_part.begin(), thrust::plus<float>());*/
+		////thrust::transform(theta_const, theta_const+NUM_PARTICLES, delta_r1_v.begin(), delta_r1_v.begin(), thrust::plus<float>());
+
 		float * x_part_kernel=thrust::raw_pointer_cast(&x_part[0]);
 		float * y_part_kernel=thrust::raw_pointer_cast(&y_part[0]);
 		float * theta_part_kernel=thrust::raw_pointer_cast(&theta_part[0]);
@@ -893,28 +1217,40 @@ int main(int argc, char** argv){
 		thrust::reduce_by_key(thrust::make_transform_iterator(thrust::counting_iterator<int>(0), lin_to_row_index<int>(numScans[index])), thrust::make_transform_iterator(thrust::counting_iterator<int>(0)+numScans[index]*NUM_PARTICLES, lin_to_row_index<int>(numScans[index])), allScores, scoreIndexes.begin(), weights.begin(), thrust::equal_to<int>(), thrust::plus<float>());
 		checkCudaErrors(cudaFree(scanScores));
 		*/
-		float max_w=thrust::reduce(weights, weights+NUM_PARTICLES, -1.0f, thrust::maximum<float>());
-		thrust::constant_iterator<float> max_w_const(max_w);
-		thrust::transform(weights, weights+NUM_PARTICLES, max_w_const, weights, thrust::divides<float>());
+		thrust::device_vector<float> nnzweights(NUM_PARTICLES);
+		//thrust::transform(weights, weights+NUM_PARTICLES, stencil.begin(), diff_from_zero());
+		thrust::copy_if(weights, weights+NUM_PARTICLES, nnzweights.begin(), diff_from_zero());
+		float max_w=*(thrust::max_element(weights, weights+NUM_PARTICLES));
+		printf("max val:%f\n", max_w);
+		thrust::transform(weights, weights+NUM_PARTICLES, weights, score_to_weight(max_w));
+		//thrust::constant_iterator<float> max_w_const(max_w);
+		//thrust::transform(weights, weights+NUM_PARTICLES, max_w_const, weights, thrust::divides<float>());
 		/*thrust::constant_iterator<float> one_const(1.0f);
 		thrust::transform(one_const, one_const+NUM_PARTICLES, weights.begin(), weights.begin(), thrust::minus<float>());
 		*/
 		zipIteratorFloatTuple zipIter=thrust::make_zip_iterator(make_tuple(x_part.begin(), y_part.begin(), theta_part.begin()));
-		thrust::sort_by_key(weights, weights+NUM_PARTICLES, zipIter);
+		//thrust::sort_by_key(weights, weights+NUM_PARTICLES, zipIter);
 		thrust::inclusive_scan(weights, weights+NUM_PARTICLES, weights);
+		thrust::transform(weights, weights+NUM_PARTICLES, thrust::make_constant_iterator(weights[NUM_PARTICLES-1]), weights, thrust::divides<float>());
 		cudaEventRecord(resample_time, 0);
 		thrust::counting_iterator<unsigned int> resampleSeed((unsigned int)resample_time);
-		
 		thrust::transform(resampleSeed, resampleSeed+NUM_PARTICLES, resampling_vector.begin(), pseudorg(0.0f, 1.0f));
 		thrust::lower_bound(weights, weights+NUM_PARTICLES, resampling_vector.begin(), resampling_vector.end(), resampled_indices.begin());
 		thrust::gather(resampled_indices.begin(), resampled_indices.end(), zipIter, zipIter);
-		float x_avg=thrust::reduce(x_part.begin(), x_part.end());
+		thrust::gather(resampled_indices.begin(), resampled_indices.end(), weights, weights);
+		/*float x_avg=thrust::reduce(x_part.begin(), x_part.end());
 		float y_avg=thrust::reduce(y_part.begin(), y_part.end());
 		float theta_avg=thrust::reduce(theta_part.begin(), theta_part.end());
 		x_avg/=NUM_PARTICLES;
 		y_avg/=NUM_PARTICLES;
 		theta_avg/=NUM_PARTICLES;
+		*/
+		thrust::device_ptr<float> max_ptr=thrust::max_element(weights, weights+NUM_PARTICLES);
+		float x_avg=x_part[max_ptr-weights];
+		float y_avg=y_part[max_ptr-weights];
+		float theta_avg=theta_part[max_ptr-weights];
 		printf("computed position: %f %f %f\n", x_avg, y_avg, theta_avg);
+		printf("max position:%d\n", max_ptr-weights);
 		updateMapBresenham<<<360, 256>>>(map, pitch/sizeof(float),scan_gpu, x_avg, y_avg, theta_avg);
 		checkCudaErrors(cudaFree(scan_gpu));
 		//checkCudaErrors(cudaFree(scanScores));
