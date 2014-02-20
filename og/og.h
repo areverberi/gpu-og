@@ -108,7 +108,12 @@ __constant__ int mapW;
 __constant__ int mapH;
 __constant__ float resolution;
 __constant__ float range_max;
-
+//thrust::device_vector<float> x_part(NUM_PARTICLES);
+//thrust::device_vector<float> y_part(NUM_PARTICLES);
+//thrust::device_vector<float> theta_part(NUM_PARTICLES);
+//thrust::device_vector<float> resampling_vector(NUM_PARTICLES);
+//thrust::device_vector<int> resampled_indices(NUM_PARTICLES);
+//thrust::device_ptr<float> weights;
 
 float normalizeAngle(float a);
 void drawFromMotion(thrust::device_vector<float>& x_part, thrust::device_vector<float>& y_part, thrust::device_vector<float>& theta_part, float x_h, float y_h, float theta_h, float x_o, float y_o, float theta_o, int seed);
@@ -117,11 +122,12 @@ bool loadLog(std::string filename, std::vector<int>& numScans, std::vector<std::
 void initMap(float * map, int w, int h, size_t pitch, int w_th, int h_th );
 void computeMatchScores(thrust::device_vector<float> & x_part, thrust::device_vector<float> & y_part, thrust::device_vector<float> & theta_part, float * scan_gpu, float * map, size_t pitch, float * scores, int numScans);
 void updateMapBresenham(float *map, size_t pitch, float * scan_gpu, float x, float y, float theta, int numBeams);
-void init(float * map, size_t * pitch, int * width, int * height, thrust::device_vector<float> & x_part, thrust::device_vector<float> & y_part, thrust::device_vector<float> & theta_part, std::vector<int> & numScans, std::vector<std::vector<float>> & scans, std::vector<float> & xs, std::vector<float> & ys, std::vector<float> & thetas, float * x_old, float * y_old, float * theta_old);
+void init(float * map, size_t * pitch, int * width, int * height, thrust::device_vector<float> & x_part, thrust::device_vector<float> & y_part, thrust::device_vector<float> & theta_part, std::vector<int> & numScans, std::vector<std::vector<float>> & scans, std::vector<float> & xs, std::vector<float> & ys, std::vector<float> & thetas, float * scores, float * x_old, float * y_old, float * theta_old);
 float * get_map( float *map_gpu, int width, int height, size_t pitch);
 void save_map(float * map_gpu, int width, int height, size_t pitch, char * filename);
 int resample(thrust::device_vector<float> & x_part, thrust::device_vector<float> & y_part, thrust::device_vector<float> & theta_part, thrust::device_ptr<float> & weights, thrust::device_vector<float> & resampling_vector, thrust::device_vector<int> & resampled_indices);
 void run();
+//void cleanup(float * map);
 inline void check_cuda_error(cudaError_t err)
 {
 	if(err!=cudaSuccess)
