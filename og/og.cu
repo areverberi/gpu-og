@@ -109,7 +109,6 @@ __global__ void initMapK(float* map, int w, int h, size_t pitch, int w_th, int h
 	}
     __syncthreads();
 }
-
 __device__ void getCoordsBresenham(float *coords, float * range, float * x_o, float * y_o, float * theta_o, int coord_sys=0)
 {
 	__shared__ int x1, y1, x2, y2;
@@ -288,7 +287,6 @@ __global__ void updateMapBresenhamK(float *map, size_t pitch, float *scan_gpu, f
 		}
 	}
 }
-
 void init(float * map, size_t * pitch, int * width, int * height, thrust::device_vector<float> & x_part, thrust::device_vector<float> & y_part, thrust::device_vector<float> & theta_part, std::vector<int> & numScans, std::vector<std::vector<float>> & scans, std::vector<float> & xs, std::vector<float> & ys, std::vector<float> & thetas, float * x_old, float * y_old, float * theta_old)
 {
 	float res=0.05f;
@@ -308,7 +306,6 @@ void init(float * map, size_t * pitch, int * width, int * height, thrust::device
 	thrust::fill(y_part.begin(), y_part.end(), *y_old);
 	thrust::fill(theta_part.begin(), theta_part.end(), *theta_old);
 }
-
 float * get_map( float *map_gpu, int width, int height, size_t pitch)
 {
 	float *mapsave;
@@ -317,7 +314,6 @@ float * get_map( float *map_gpu, int width, int height, size_t pitch)
 	check_cuda_error(cudaMemcpy2D(mapsave, pitchSave, map_gpu, pitch, width*sizeof(float), height, cudaMemcpyDeviceToHost));
 	return mapsave;
 }
-
 void save_map(float * map_gpu, int width, int height, size_t pitch, char * filename)
 {
 	float *mapsave;
@@ -429,5 +425,7 @@ void run()
 	
 	float avg_time=tot_time/numScans.size();
 	printf("avg time:%f\n", avg_time);
+	check_cuda_error(cudaFree(map));
+	thrust::device_free(weights);
 	getchar();
 }
