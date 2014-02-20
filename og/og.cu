@@ -1,110 +1,8 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include "string.h"
-#include <stddef.h>
-#include <vector>
-#define _USE_MATH_DEFINES
-#include "math.h"
-#include "helper_cuda.h"
-#include<cuda.h>
-#include <thrust/iterator/constant_iterator.h>
-#include <thrust/device_vector.h>
-#include <thrust/transform.h>
-#include <thrust/functional.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/iterator/zip_iterator.h>
-#include <thrust/iterator/transform_iterator.h>
-#include <thrust/tuple.h>
-#include <thrust/fill.h>
-#include <thrust/sequence.h>
-#include <thrust/random.h>
-#include <thrust/device_ptr.h>
-#include <thrust/reduce.h>
-#include <thrust/sort.h>
-#include <thrust/scan.h>
-#include <thrust/binary_search.h>
-#include <thrust/gather.h>
+#include "og.h"
 
-#define NUM_PARTICLES 1000
-#define SRR 0.1f
-#define STR 0.1f
-#define SRT 0.1f
-#define STT 0.1f
-
-typedef thrust::device_vector<float>::iterator floatIterator;
-typedef thrust::tuple<floatIterator, floatIterator, floatIterator> floatIterTuple;
-typedef thrust::zip_iterator<floatIterTuple> zipIteratorFloatTuple;
-
-struct pseudorgnorm
-{
-	float a,b;
-	__host__ __device__ pseudorgnorm(float _a=0.0f, float _b=1.0f): a(_a), b(_b) {};
-	__host__ __device__ float operator()(const unsigned int n)const
-	{
-		thrust::default_random_engine rng;
-		thrust::normal_distribution<float>dist(a,b);
-		rng.discard(n);
-		return dist(rng);
-	}
-};
-
-struct pseudorg
-{
-	float a,b;
-	__host__ __device__ pseudorg(float _a=0.0f, float _b=1.0f): a(_a), b(_b) {};
-	__host__ __device__ float operator()(const unsigned int n)const
-	{
-		thrust::default_random_engine rng;
-		thrust::uniform_real_distribution<float>dist(a,b);
-		rng.discard(n);
-		return dist(rng);
-	}
-};
-
-template <typename T> 
-struct cos_v : public thrust::unary_function<T, T>
-{
-	__host__ __device__ T operator()(T i)
-	{
-		return __cosf(i);
-	}
-};
-
-struct correctAngle : public thrust::unary_function<float, float>
-{
-	float modulo;
-	__host__ __device__ correctAngle(float _modulo): modulo(_modulo){}
-	__host__ __device__ float operator()(float i)
-	{
-		i=fmodf(i, modulo);
-		if(i>(modulo/2))
-			i-=modulo;
-		return i;
-	}
-};
-template <typename T> 
-struct sin_v : public thrust::unary_function<T, T>
-{
-	__host__ __device__ T operator()(T i)
-	{
-		return __sinf(i);
-	}
-};
-
-struct score_to_weight : public thrust::unary_function<float, float>
-{
-	float max_val;
-	__host__ __device__ score_to_weight(float _max_val): max_val(_max_val){}
-	__host__ __device__ float operator()(float i)
-	{
-		return expf(1/(0.075*NUM_PARTICLES)*(i-max_val));
-	}
-};
-
-__constant__ int mapW;
-__constant__ int mapH;
-__constant__ float resolution;
-__constant__ float range_max;
+__global__ void initMapK(float* map, int w, int h, size_t pitch, int w_th, int h_th);
+__global__ void computeMatchScoresK(float * x_part, float * y_part, float * theta_part, float * scan_gpu, float *map, size_t pitch, float * scores);
+__global__ void updateMapBresenhamK(float *map, size_t pitch, float *scan_gpu, float x, float y, float theta);
 
 float normalizeAngle(float a)
 {
@@ -187,7 +85,14 @@ bool loadLog(std::string filename, std::vector<int>& numScans, std::vector<std::
 	while(readLine(file, numScans, scans, x, y, theta));
 	return true;
 }
-__global__ void initMap(float* map, int w, int h, size_t pitch, int w_th, int h_th){
+void initMap(float * map, int w, int h, size_t pitch, int w_th, int h_th )
+{
+	dim3 numThr(32, 32);
+	dim3 numBlocks(w/numThr.x, h/numThr.y);
+    initMapK <<<numBlocks, numThr>>> (map, w, h, pitch/sizeof(float), 1, 1);
+	
+}
+__global__ void initMapK(float* map, int w, int h, size_t pitch, int w_th, int h_th){
 	unsigned int idx=blockIdx.x*blockDim.x+threadIdx.x;
 	unsigned int idy=blockIdx.y*blockDim.y+threadIdx.y;
 	for(unsigned int i=0; i<h_th; ++i)
@@ -265,8 +170,14 @@ __device__ void getCoordsBresenham(float *coords, float * range, float * x_o, fl
 		coords[2]=-1;
 	}
 }
-
-__global__ void computeMatchScores(float * x_part, float * y_part, float * theta_part, float * scan_gpu, float *map, size_t pitch, float * scores)
+void computeMatchScores(thrust::device_vector<float> & x_part, thrust::device_vector<float> & y_part, thrust::device_vector<float> & theta_part, float * scan_gpu, float * map, size_t pitch, float * scores, int numScans)
+{
+	float * x_part_kernel=thrust::raw_pointer_cast(&x_part[0]);
+	float * y_part_kernel=thrust::raw_pointer_cast(&y_part[0]);
+	float * theta_part_kernel=thrust::raw_pointer_cast(&theta_part[0]);
+	computeMatchScoresK<<<NUM_PARTICLES, numScans >>>(x_part_kernel, y_part_kernel, theta_part_kernel, scan_gpu, map, pitch, scores);
+}
+__global__ void computeMatchScoresK(float * x_part, float * y_part, float * theta_part, float * scan_gpu, float *map, size_t pitch, float * scores)
 {
 	__shared__ float x,y,theta;
 	__shared__ float score;
@@ -320,8 +231,11 @@ __global__ void computeMatchScores(float * x_part, float * y_part, float * theta
 		scores[blockIdx.x]=(float)score;
 	}
 }
-
-__global__ void updateMapBresenham(float *map, size_t pitch, float *scan_gpu, float x, float y, float theta){
+void updateMapBresenham(float *map, size_t pitch, float * scan_gpu, float x, float y, float theta, int numBeams)
+{
+	updateMapBresenhamK<<<numBeams, 256>>>(map, pitch, scan_gpu, x, y, theta);
+}
+__global__ void updateMapBresenhamK(float *map, size_t pitch, float *scan_gpu, float x, float y, float theta){
 	__shared__ float range;
 	float coords[3];
 	if(threadIdx.x==0)
@@ -375,146 +289,141 @@ __global__ void updateMapBresenham(float *map, size_t pitch, float *scan_gpu, fl
 	}
 }
 
-int main(int argc, char** argv){
-	int map_size=1600;
-	int width=map_size;
-    int height=map_size;
+void init(float * map, size_t * pitch, int * width, int * height, thrust::device_vector<float> & x_part, thrust::device_vector<float> & y_part, thrust::device_vector<float> & theta_part, std::vector<int> & numScans, std::vector<std::vector<float>> & scans, std::vector<float> & xs, std::vector<float> & ys, std::vector<float> & thetas, float * x_old, float * y_old, float * theta_old)
+{
 	float res=0.05f;
 	float rmax=50.0f;
-    float* map;
-    size_t pitch;
-	checkCudaErrors(cudaMallocPitch(&map,&pitch,width*sizeof(float), height));
-	checkCudaErrors(cudaMemcpyToSymbol(mapW, &width, sizeof(int)));
-	checkCudaErrors(cudaMemcpyToSymbol(mapH, &height, sizeof(int)));
-	checkCudaErrors(cudaMemcpyToSymbol(resolution, &res, sizeof(float)));
-	checkCudaErrors(cudaMemcpyToSymbol(range_max, &rmax, sizeof(float)));
+	check_cuda_error(cudaMemcpyToSymbol(mapW, width, sizeof(int)));
+	check_cuda_error(cudaMemcpyToSymbol(mapH, height, sizeof(int)));
+	check_cuda_error(cudaMemcpyToSymbol(resolution, &res, sizeof(float)));
+	check_cuda_error(cudaMemcpyToSymbol(range_max, &rmax, sizeof(float)));
 	dim3 numThr(32, 32);
-	dim3 numBlocks(width/numThr.x, height/numThr.y);
-    initMap <<<numBlocks, numThr>>> (map, width, height, pitch/sizeof(float), 1, 1);
-	thrust::device_vector<float> delta_t_v(NUM_PARTICLES);
-	thrust::device_vector<float> delta_r1_v(NUM_PARTICLES);
-	thrust::device_vector<float> delta_r2_v(NUM_PARTICLES);
-	thrust::device_vector<float> temp(NUM_PARTICLES);
-	thrust::device_vector<float> x_part(NUM_PARTICLES);
-	thrust::device_vector<float> y_part(NUM_PARTICLES);
-	thrust::device_vector<float> theta_part(NUM_PARTICLES);
-	float * scanScores;
-	checkCudaErrors(cudaMalloc(&scanScores, NUM_PARTICLES*sizeof(float)));
-	thrust::device_ptr<float> weights(scanScores);
-	thrust::device_vector<float> resampling_vector(NUM_PARTICLES);
-	thrust::device_vector<int> resampled_indices(NUM_PARTICLES);
-	cudaError_t err=cudaGetLastError();
-	if (err != cudaSuccess) 
-		printf("Error: %s\n", cudaGetErrorString(err));
-	checkCudaErrors(cudaDeviceSynchronize());
+	dim3 numBlocks(*width/numThr.x, *height/numThr.y);
+    initMap(map, *width, *height, *pitch, 1, 1);
+	bool open=loadLog("fr079.log", numScans, scans, xs, ys, thetas);
+	*x_old=xs[0];
+	*y_old=ys[0];
+	*theta_old=thetas[0];
+	thrust::fill(x_part.begin(), x_part.end(), *x_old);
+	thrust::fill(y_part.begin(), y_part.end(), *y_old);
+	thrust::fill(theta_part.begin(), theta_part.end(), *theta_old);
+}
+
+float * get_map( float *map_gpu, int width, int height, size_t pitch)
+{
 	float *mapsave;
-	cudaError_t status=cudaMallocHost(&mapsave, width*height*sizeof(float));
-	if(status!=cudaSuccess)
-		printf("error allocating pinned memory\n");
+	check_cuda_error(cudaMallocHost(&mapsave, width*height*sizeof(float)));
 	size_t pitchSave=sizeof(float)*width;
-	checkCudaErrors(cudaMemcpy2D(mapsave, pitchSave, map, pitch, width*sizeof(float), height, cudaMemcpyDeviceToHost));
+	check_cuda_error(cudaMemcpy2D(mapsave, pitchSave, map_gpu, pitch, width*sizeof(float), height, cudaMemcpyDeviceToHost));
+	return mapsave;
+}
+
+void save_map(float * map_gpu, int width, int height, size_t pitch, char * filename)
+{
+	float *mapsave;
+	mapsave=get_map(map_gpu, width, height, pitch);
 	FILE *img;
-	img=fopen("mapinit.dat", "w");
+	img=fopen(filename, "wb");
 	if(img!=NULL){
 		fwrite(mapsave, sizeof(float), width*height, img);
 	}
 	cudaFreeHost(mapsave);
 	fclose(img);
-	float ares=2*M_PI/360.0f;
-	int numReadings=(int)(M_PI*2/ares);
+}
+int resample(thrust::device_vector<float> & x_part, thrust::device_vector<float> & y_part, thrust::device_vector<float> & theta_part, thrust::device_ptr<float> & weights, thrust::device_vector<float> & resampling_vector, thrust::device_vector<int> & resampled_indices)
+{
+	cudaEvent_t resample_time;
+	check_cuda_error(cudaEventCreate(&resample_time));
+	float max_w=*(thrust::max_element(weights, weights+NUM_PARTICLES));
+	thrust::transform(weights, weights+NUM_PARTICLES, weights, score_to_weight(max_w));
+	zipIteratorFloatTuple zipIter=thrust::make_zip_iterator(make_tuple(x_part.begin(), y_part.begin(), theta_part.begin()));
+	thrust::inclusive_scan(weights, weights+NUM_PARTICLES, weights);
+	thrust::transform(weights, weights+NUM_PARTICLES, thrust::make_constant_iterator(weights[NUM_PARTICLES-1]), weights, thrust::divides<float>());
+	check_cuda_error(cudaEventRecord(resample_time, 0));
+	thrust::counting_iterator<unsigned int> resampleSeed((unsigned int)resample_time);
+	thrust::transform(resampleSeed, resampleSeed+NUM_PARTICLES, resampling_vector.begin(), pseudorg(0.0f, 1.0f));
+	thrust::lower_bound(weights, weights+NUM_PARTICLES, resampling_vector.begin(), resampling_vector.end(), resampled_indices.begin());
+	thrust::gather(resampled_indices.begin(), resampled_indices.end(), zipIter, zipIter);
+	thrust::gather(resampled_indices.begin(), resampled_indices.end(), weights, weights);
+	thrust::device_ptr<float> max_ptr=thrust::max_element(weights, weights+NUM_PARTICLES);
+	return max_ptr-weights;
+}
+
+void run()
+{
+	int map_size=1600;
+	int width=map_size;
+    int height=map_size;
+    float* map;
+    size_t pitch;
+	check_cuda_error(cudaMallocPitch(&map,&pitch,width*sizeof(float), height));
+	thrust::device_vector<float> x_part(NUM_PARTICLES);
+	thrust::device_vector<float> y_part(NUM_PARTICLES);
+	thrust::device_vector<float> theta_part(NUM_PARTICLES);
+	float * scanScores;
+	check_cuda_error(cudaMalloc(&scanScores, NUM_PARTICLES*sizeof(float)));
+	thrust::device_ptr<float> weights(scanScores);
+	thrust::device_vector<float> resampling_vector(NUM_PARTICLES);
+	thrust::device_vector<int> resampled_indices(NUM_PARTICLES);
 	std::vector<int> numScans;
 	std::vector<std::vector<float>> scans;
-	std::vector<float> xs;
-	std::vector<float> ys;
-	std::vector<float> thetas;
-	bool open=loadLog("fr079.log", numScans, scans, xs, ys, thetas);
+	std::vector<float> xs, ys, thetas;
+	float x_old, y_old, theta_old;
+	init(map, &pitch, &width, &height, x_part, y_part, theta_part, numScans, scans, xs, ys, thetas, &x_old, &y_old, &theta_old);
+	check_cuda_error(cudaGetLastError());
+	save_map(map, width, height, pitch, "mapinit.dat");
+	float ares=2*M_PI/360.0f;
+	int numReadings=(int)(M_PI*2/ares);
 	
 	int index;
 	float tot_time=0.0f;
-	float x_old=xs[0];
-	float y_old=ys[0];
-	float theta_old=thetas[0];
-	thrust::fill(x_part.begin(), x_part.end(), x_old);
-	thrust::fill(y_part.begin(), y_part.end(), y_old);
-	thrust::fill(theta_part.begin(), theta_part.end(), theta_old);
-    for(index=0; index<numScans.size(); index++){
+	for(index=0; index<numScans.size(); index++){
 		/*taking one range reading at a time*/
-		cudaEvent_t start, stop, resample_time;
+		cudaEvent_t start, stop;
 		cudaEvent_t startScores, stopScores;
 		float time;
-		cudaEventCreate(&start);
-		cudaEventCreate(&stop);
-		cudaEventCreate(&resample_time);
-		cudaEventCreate(&startScores);
-		cudaEventCreate(&stopScores);
-		cudaEventRecord(start, 0);
+		check_cuda_error(cudaEventCreate(&start));
+		check_cuda_error(cudaEventCreate(&stop));
+		check_cuda_error(cudaEventCreate(&startScores));
+		check_cuda_error(cudaEventCreate(&stopScores));
+		check_cuda_error(cudaEventRecord(start, 0));
         std::vector<float> scan=scans[index];
 		float x_h;
 		float y_h;
 		float theta_h;
+		printf("%d\n", index);
 		x_h=xs[index];
         y_h=ys[index];
         theta_h=thetas[index];
 		printf("position:%f %f %f\n", x_h, y_h, theta_h);
 		float *scan_gpu;
-		checkCudaErrors(cudaMalloc(&scan_gpu, sizeof(float)*numReadings));
-		checkCudaErrors(cudaMemcpy(scan_gpu, &scan[0], numReadings*sizeof(float), cudaMemcpyHostToDevice));
+		check_cuda_error(cudaMalloc(&scan_gpu, sizeof(float)*numReadings));
+		check_cuda_error(cudaMemcpy(scan_gpu, &scan[0], numReadings*sizeof(float), cudaMemcpyHostToDevice));
 		drawFromMotion(x_part, y_part, theta_part, x_h, y_h, theta_h, x_old, y_old, theta_old, (int)start);
-
-		float * x_part_kernel=thrust::raw_pointer_cast(&x_part[0]);
-		float * y_part_kernel=thrust::raw_pointer_cast(&y_part[0]);
-		float * theta_part_kernel=thrust::raw_pointer_cast(&theta_part[0]);
-		
-		dim3 blocksScores(numScans[index], 256);
-		computeMatchScores<<<NUM_PARTICLES, numScans[index] >>>(x_part_kernel, y_part_kernel, theta_part_kernel, scan_gpu, map, pitch/sizeof(float), scanScores);
-		float max_w=*(thrust::max_element(weights, weights+NUM_PARTICLES));
-		thrust::transform(weights, weights+NUM_PARTICLES, weights, score_to_weight(max_w));
-		zipIteratorFloatTuple zipIter=thrust::make_zip_iterator(make_tuple(x_part.begin(), y_part.begin(), theta_part.begin()));
-		thrust::inclusive_scan(weights, weights+NUM_PARTICLES, weights);
-		thrust::transform(weights, weights+NUM_PARTICLES, thrust::make_constant_iterator(weights[NUM_PARTICLES-1]), weights, thrust::divides<float>());
-		cudaEventRecord(resample_time, 0);
-		thrust::counting_iterator<unsigned int> resampleSeed((unsigned int)resample_time);
-		thrust::transform(resampleSeed, resampleSeed+NUM_PARTICLES, resampling_vector.begin(), pseudorg(0.0f, 1.0f));
-		thrust::lower_bound(weights, weights+NUM_PARTICLES, resampling_vector.begin(), resampling_vector.end(), resampled_indices.begin());
-		thrust::gather(resampled_indices.begin(), resampled_indices.end(), zipIter, zipIter);
-		thrust::gather(resampled_indices.begin(), resampled_indices.end(), weights, weights);
-		thrust::device_ptr<float> max_ptr=thrust::max_element(weights, weights+NUM_PARTICLES);
-		float x_avg=x_part[max_ptr-weights];
-		float y_avg=y_part[max_ptr-weights];
-		float theta_avg=theta_part[max_ptr-weights];
+		computeMatchScores(x_part, y_part, theta_part, scan_gpu, map, pitch/sizeof(float), scanScores, numScans[index]);
+		check_cuda_error(cudaGetLastError());
+		int best_pos=resample(x_part, y_part, theta_part, weights, resampling_vector, resampled_indices);
+		float x_avg=x_part[best_pos];
+		float y_avg=y_part[best_pos];
+		float theta_avg=theta_part[best_pos];
 		printf("computed position: %f %f %f\n", x_avg, y_avg, theta_avg);
-		updateMapBresenham<<<360, 256>>>(map, pitch/sizeof(float),scan_gpu, x_avg, y_avg, theta_avg);
-		checkCudaErrors(cudaFree(scan_gpu));
-		cudaEventRecord(stop, 0);
-		cudaEventSynchronize(stop);
-		cudaEventElapsedTime(&time, start, stop);
-		cudaEventDestroy(start);
-		cudaEventDestroy(stop);
+		updateMapBresenham(map, pitch/sizeof(float),scan_gpu, x_avg, y_avg, theta_avg, numScans[index]);
+		check_cuda_error(cudaGetLastError());
+		check_cuda_error(cudaFree(scan_gpu));
+		check_cuda_error(cudaEventRecord(stop, 0));
+		check_cuda_error(cudaEventSynchronize(stop));
+		check_cuda_error(cudaEventElapsedTime(&time, start, stop));
+		check_cuda_error(cudaEventDestroy(start));
+		check_cuda_error(cudaEventDestroy(stop));
 		tot_time+=time;
-		cudaError_t err=cudaGetLastError();
-		if (err != cudaSuccess){ 
-			printf("Error: %s\n", cudaGetErrorString(err));
-			return -1;
-		}
+		check_cuda_error(cudaGetLastError());
 		x_old=x_h;
 		y_old=y_h;
 		theta_old=theta_h;
 		if(index%100==0){
-			float *mapsave;
-			/*saving map at every iteration, just for testing purposes*/
-			cudaMallocHost(&mapsave, width*height*sizeof(float));
-			size_t pitchSave=sizeof(float)*width;
-			checkCudaErrors(cudaMemcpy2D(mapsave, pitchSave, map, pitch, width*sizeof(float), height, cudaMemcpyDeviceToHost));
-			FILE *img;
 			char filename[40];
 			sprintf(filename, "map%d.dat", index);
-			img=fopen(filename, "wb");
-			if(img!=NULL){
-				fwrite(mapsave, sizeof(float), width*height, img);
-				
-			}
-			cudaFreeHost(mapsave);
-			fclose(img);
+			save_map(map, width, height, pitch, filename);
 		}
     }
 	
