@@ -329,17 +329,18 @@ void save_map(float * map_gpu, int width, int height, size_t pitch, char * filen
 }
 int resample(thrust::device_vector<float> & x_part, thrust::device_vector<float> & y_part, thrust::device_vector<float> & theta_part, thrust::device_ptr<float> & weights, thrust::device_vector<float> & resampling_vector, thrust::device_vector<int> & resampled_indices)
 {
-	cudaEvent_t resample_time;
-	check_cuda_error(cudaEventCreate(&resample_time));
+	//cudaEvent_t resample_time;
+	//check_cuda_error(cudaEventCreate(&resample_time));
 	float max_w=*(thrust::max_element(weights, weights+NUM_PARTICLES));
 	thrust::transform(weights, weights+NUM_PARTICLES, weights, score_to_weight(max_w));
 	zipIteratorFloatTuple zipIter=thrust::make_zip_iterator(make_tuple(x_part.begin(), y_part.begin(), theta_part.begin()));
-	thrust::inclusive_scan(weights, weights+NUM_PARTICLES, weights);
-	thrust::transform(weights, weights+NUM_PARTICLES, thrust::make_constant_iterator(weights[NUM_PARTICLES-1]), weights, thrust::divides<float>());
-	check_cuda_error(cudaEventRecord(resample_time, 0));
-	thrust::counting_iterator<unsigned int> resampleSeed((unsigned int)resample_time);
+	thrust::device_vector<float> weights_sum(NUM_PARTICLES);
+	thrust::inclusive_scan(weights, weights+NUM_PARTICLES, weights_sum.begin());
+	thrust::transform(weights_sum.begin(), weights_sum.end(), thrust::make_constant_iterator(weights_sum[NUM_PARTICLES-1]), weights_sum.begin(), thrust::divides<float>());
+	//check_cuda_error(cudaEventRecord(resample_time, 0));
+	thrust::counting_iterator<unsigned int> resampleSeed((unsigned int)clock());
 	thrust::transform(resampleSeed, resampleSeed+NUM_PARTICLES, resampling_vector.begin(), pseudorg(0.0f, 1.0f));
-	thrust::lower_bound(weights, weights+NUM_PARTICLES, resampling_vector.begin(), resampling_vector.end(), resampled_indices.begin());
+	thrust::lower_bound(weights_sum.begin(), weights_sum.end(), resampling_vector.begin(), resampling_vector.end(), resampled_indices.begin());
 	thrust::gather(resampled_indices.begin(), resampled_indices.end(), zipIter, zipIter);
 	thrust::gather(resampled_indices.begin(), resampled_indices.end(), weights, weights);
 	thrust::device_ptr<float> max_ptr=thrust::max_element(weights, weights+NUM_PARTICLES);
@@ -397,7 +398,7 @@ void run()
 		float *scan_gpu;
 		check_cuda_error(cudaMalloc(&scan_gpu, sizeof(float)*numReadings));
 		check_cuda_error(cudaMemcpy(scan_gpu, &scan[0], numReadings*sizeof(float), cudaMemcpyHostToDevice));
-		drawFromMotion(x_part, y_part, theta_part, x_h, y_h, theta_h, x_old, y_old, theta_old, (int)start);
+		drawFromMotion(x_part, y_part, theta_part, x_h, y_h, theta_h, x_old, y_old, theta_old, (unsigned int)clock());
 		computeMatchScores(x_part, y_part, theta_part, scan_gpu, map, pitch/sizeof(float), scanScores, numScans[index]);
 		check_cuda_error(cudaGetLastError());
 		int best_pos=resample(x_part, y_part, theta_part, weights, resampling_vector, resampled_indices);

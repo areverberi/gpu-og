@@ -108,6 +108,7 @@ __constant__ int mapW;
 __constant__ int mapH;
 __constant__ float resolution;
 __constant__ float range_max;
+
 //thrust::device_vector<float> x_part(NUM_PARTICLES);
 //thrust::device_vector<float> y_part(NUM_PARTICLES);
 //thrust::device_vector<float> theta_part(NUM_PARTICLES);
