@@ -1,4 +1,4 @@
 gpu-og
 ======
 
-SLAM on GPU. Based on the CARMEN logfile format.
+SLAM on GPU. Integrated in a ROS node, uses typical ROS messages such as Laserscan, Odometry and OccupancyGrid.
