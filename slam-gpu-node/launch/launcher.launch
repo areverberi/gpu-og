@@ -1,5 +1,0 @@
-<launch>
-	<param name="use_sim_time" value="true" />
-	<node pkg="slam-gpu-node" type="slam-gpu-node" name="slam_gpu" />
-	<node pkg="rosbag" type="play" name="player" args="--clock /home/orgrim/catkin_ws/test.bag"/>
-</launch>
